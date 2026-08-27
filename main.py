@@ -1,19 +1,18 @@
 """
 ========================================================================================
-V50.3 Ultimate Cloud Forex & Gold Engine - Stable Dispatch & No-Fail Formatting
+V50.4 Ultimate Cloud Forex & Gold Engine - Fixed Plain Text Dispatch
 ========================================================================================
 """
 
-import asyncio
-import logging
 import os
 import time
-from datetime import datetime, timedelta, timezone
-from threading import Thread
+import logging
+import requests
 import numpy as np
 import pandas as pd
-import requests
 import yfinance as yf
+from threading import Thread
+from datetime import datetime, timedelta, timezone
 from flask import Flask
 
 # --- إعدادات التسجيل ---
@@ -54,7 +53,7 @@ def keep_alive():
     t.start()
 
 # ======================================================================================== #
-# 2. إرسال التليجرام المباشر والمضمون (Plain Text)
+# 2. إرسال التليجرام المباشر (Plain Text)
 # ======================================================================================== #
 def get_local_time():
     return datetime.now(LOCAL_TZ).strftime("%I:%M %p")
@@ -220,24 +219,24 @@ def track_active_trades():
             if not trade.get('tp1_hit') and current_price >= trade['tp1']:
                 trade['tp1_hit'] = True
                 send_telegram_direct(
-                    f"🎯 {symbol_name} - TP1 Hit!\n"
-                    f"✅ تم تحقيق الهدف الأول عند {format_price(symbol_name, trade['tp1'])}\n"
-                    f"🛡 إجراء مطلوب: انقل الوقف إلى سعر الدخول ({format_price(symbol_name, trade['entry'])}) لتأمين الصفقة."
+                    f"TP1 Hit: {symbol_name}\n"
+                    f"Target 1 Reached: {format_price(symbol_name, trade['tp1'])}\n"
+                    f"Action: Move Stop Loss to Entry ({format_price(symbol_name, trade['entry'])})"
                 )
             elif current_price <= trade['stop']:
-                send_telegram_direct(f"🛑 {symbol_name} - Stop Loss Hit\nتم إغلاق الصفقة عند {format_price(symbol_name, trade['stop'])}")
+                send_telegram_direct(f"Stop Loss Hit: {symbol_name}\nTrade closed at {format_price(symbol_name, trade['stop'])}")
                 del active_trades[symbol_name]
 
         elif trade['direction'] == "SHORT":
             if not trade.get('tp1_hit') and current_price <= trade['tp1']:
                 trade['tp1_hit'] = True
                 send_telegram_direct(
-                    f"🎯 {symbol_name} - TP1 Hit!\n"
-                    f"✅ تم تحقيق الهدف الأول عند {format_price(symbol_name, trade['tp1'])}\n"
-                    f"🛡 إجراء مطلوب: انقل الوقف إلى سعر الدخول ({format_price(symbol_name, trade['entry'])}) لتأمين الصفقة."
+                    f"TP1 Hit: {symbol_name}\n"
+                    f"Target 1 Reached: {format_price(symbol_name, trade['tp1'])}\n"
+                    f"Action: Move Stop Loss to Entry ({format_price(symbol_name, trade['entry'])})"
                 )
             elif current_price >= trade['stop']:
-                send_telegram_direct(f"🛑 {symbol_name} - Stop Loss Hit\nتم إغلاق الصفقة عند {format_price(symbol_name, trade['stop'])}")
+                send_telegram_direct(f"Stop Loss Hit: {symbol_name}\nTrade closed at {format_price(symbol_name, trade['stop'])}")
                 del active_trades[symbol_name]
 
 # ======================================================================================== #
@@ -245,9 +244,9 @@ def track_active_trades():
 # ======================================================================================== #
 def main():
     welcome_msg = (
-        "🚀 Welcome to Forex & Gold Engine V50.3!\n\n"
-        "• Status: Engine Active & Connected Successfully!\n"
-        "• Features: Live Trade Tracking, Session Filter & Risk Matrix Active."
+        "Forex & Gold Engine V50.4 Active!\n\n"
+        "Status: System Online and connected to Railway.\n"
+        "Waiting for high-probability setups..."
     )
     send_telegram_direct(welcome_msg)
 
@@ -266,22 +265,21 @@ def main():
                 if trade:
                     signaled_history[display_name] = now_ts
                     active_trades[display_name] = trade
-                    sym_title = "🏆 GOLD (XAUUSD)" if "XAU" in trade['symbol'] else f"💱 {trade['symbol']}"
                     
                     msg = (
-                        f"🔱 {sym_title} ({trade['direction']})\n\n"
-                        f"📌 Entry Target: {format_price(trade['symbol'], trade['entry'])}\n\n"
-                        f"🎯 Take-Profit Targets:\n"
+                        f"SIGNAL: {trade['symbol']} ({trade['direction']})\n\n"
+                        f"Entry Target: {format_price(trade['symbol'], trade['entry'])}\n\n"
+                        f"Take-Profit Targets:\n"
                         f"1) {format_price(trade['symbol'], trade['tp1'])}\n"
                         f"2) {format_price(trade['symbol'], trade['tp2'])}\n"
                         f"3) {format_price(trade['symbol'], trade['tp3'])}\n\n"
-                        f"🛑 Stop Target:\n"
+                        f"Stop Target:\n"
                         f"1) {format_price(trade['symbol'], trade['stop'])}\n\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"📏 Recommended Lot Sizes (1% Risk):\n"
+                        f"----------------------------------------\n"
+                        f"Recommended Lot Sizes (1% Risk):\n"
                         f"{trade['lot_matrix']}\n\n"
-                        f"📊 Risk-Reward: {trade['rr']}:1\n"
-                        f"⏰ Time: {get_local_time()}"
+                        f"Risk-Reward Ratio: {trade['rr']}:1\n"
+                        f"Time: {get_local_time()}"
                     )
                     send_telegram_direct(msg)
 
