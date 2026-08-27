@@ -1,6 +1,6 @@
 """
 ========================================================================================
-V50.5 Ultimate Cloud Forex & Gold Engine - Live Scan Logging
+V50.9 Compact Forex & Gold Engine - With Direct MetaTrader Button
 ========================================================================================
 """
 
@@ -15,23 +15,24 @@ from threading import Thread
 from datetime import datetime, timedelta, timezone
 from flask import Flask
 
-# --- إعدادات التسجيل ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '8664695982:AAHMaTwCbX1aV1sZjKlie1jK5zJB4tXFSVo')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '6021016826')
 
 SYMBOL_MAP = {
-    "GC=F": "XAUUSD",
-    "EURUSD=X": "EURUSD",
-    "GBPUSD=X": "GBPUSD",
-    "JPY=X": "USDJPY"
+    "GC=F": "XAU/USD",
+    "EURUSD=X": "EUR/USD",
+    "GBPUSD=X": "GBP/USD",
+    "JPY=X": "USD/JPY"
 }
 
 CHECK_INTERVAL = 20
 MIN_RR_RATIO = 2.5
 COOLDOWN_HOURS = 4.0
-RISK_PER_TRADE = 0.01
+
+REPORT_INTERVAL = 7200
+last_report_time = 0
 
 LOCAL_TZ = timezone(timedelta(hours=3))
 signaled_history = {}
@@ -49,23 +50,27 @@ def keep_alive():
     t.start()
 
 def get_local_time():
-    return datetime.now(LOCAL_TZ).strftime("%I:%M %p")
+    return datetime.now(LOCAL_TZ).strftime("%H:%M")
 
 def format_price(symbol, price):
     if "JPY" in symbol: return f"{price:.3f}"
     elif "XAU" in symbol or "GC=F" in symbol: return f"{price:.2f}"
     else: return f"{price:.5f}"
 
-def send_telegram_direct(message):
+# دالة إرسال الرسائل مع دعم أزرار Inline
+def send_telegram_direct(message, reply_markup=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
+        "parse_mode": "Markdown",
         "disable_web_page_preview": True
     }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
     try:
         res = requests.post(url, json=payload, timeout=10)
-        logging.info(f"Telegram Direct Send Status: {res.status_code}")
         return res.json()
     except Exception as e:
         logging.error(f"Telegram Direct Error: {e}")
@@ -76,7 +81,7 @@ def is_valid_session():
     return 7 <= now_utc <= 21
 
 def check_volatility_spike(df):
-    tr = np.maximum(df['high'] - df['low'], abs(df['high'] - df['close'].shift(1)))
+    tr = np.maximum(df['high'] - df['low'], abs(df['close'] - df['close'].shift(1)))
     atr = tr.rolling(14).mean().iloc[-1]
     last_candle_body = abs(df['close'].iloc[-1] - df['open'].iloc[-1])
     return last_candle_body > (atr * 2.8)
@@ -124,20 +129,6 @@ def find_swings(df, length=5):
             lows.append(df['low'].iloc[i])
     return highs, lows
 
-def calculate_lot_matrix(entry, stop, symbol):
-    pips_at_risk = abs(entry - stop)
-    if pips_at_risk == 0: return "- $10 to $10,000: 0.01 Lot"
-    accounts = [10, 50, 100, 500, 1000, 5000, 10000]
-    matrix_lines = []
-    for acc in accounts:
-        risk_amount = acc * RISK_PER_TRADE
-        if "XAU" in symbol or "GC=F" in symbol:
-            lot = max(0.01, round(risk_amount / (pips_at_risk * 100), 2))
-        else:
-            lot = max(0.01, round(risk_amount / (pips_at_risk * 10000 * 10.0), 2))
-        matrix_lines.append(f"- ${acc:,}: {lot} Lot")
-    return "\n".join(matrix_lines)
-
 def calculate_trade_setup(symbol, entry, direction, df_15m):
     high_low = df_15m['high'] - df_15m['low']
     atr = high_low.rolling(14).mean().iloc[-2]
@@ -153,32 +144,36 @@ def calculate_trade_setup(symbol, entry, direction, df_15m):
         tp1, tp2, tp3 = entry - (risk * 1.2), entry - (risk * 2.5), entry - (risk * 4.0)
 
     rr = abs(tp2 - entry) / abs(entry - stop) if abs(entry - stop) > 0 else 2.5
-    lot_matrix = calculate_lot_matrix(entry, stop, symbol)
-    return stop, tp1, tp2, tp3, round(rr, 2), lot_matrix
+    return stop, tp1, tp2, tp3, round(rr, 2)
+
+def send_periodic_market_report():
+    report_lines = [
+        "📊 *[ MARKET SCAN ]*",
+        f"🕒 `{get_local_time()}`\n"
+    ]
+    
+    for yf_symbol, display_name in SYMBOL_MAP.items():
+        df = fetch_candles(yf_symbol, "15m", "2d")
+        if df is not None and not df.empty:
+            price = df['close'].iloc[-1]
+            rsi = calculate_rsi(df).iloc[-1]
+            report_lines.append(f"• *{display_name}:* `{format_price(display_name, price)}` | RSI `{rsi:.0f}`")
+            
+    send_telegram_direct("\n".join(report_lines))
 
 def analyze_symbol(yf_symbol):
     display_name = SYMBOL_MAP[yf_symbol]
-    
-    if not is_valid_session(): 
-        logging.info(f"[{display_name}] Skipped: Outside Trading Hours")
-        return None
+    if not is_valid_session(): return None
     
     df_15m = fetch_candles(yf_symbol, "15m", "5d")
     df_1h = fetch_candles(yf_symbol, "1h", "7d")
     
-    if df_15m is None or df_1h is None or len(df_15m) < 30: 
-        logging.info(f"[{display_name}] Skipped: Insufficient Data")
-        return None
-        
-    if check_volatility_spike(df_15m): 
-        logging.info(f"[{display_name}] Skipped: Volatility Spike Detected")
-        return None
+    if df_15m is None or df_1h is None or len(df_15m) < 30: return None
+    if check_volatility_spike(df_15m): return None
 
     live_price = float(df_15m['close'].iloc[-1])
     highs, lows = find_swings(df_15m)
-    if len(highs) < 2 or len(lows) < 2: 
-        logging.info(f"[{display_name}] Skipped: No Clear Swing Pattern (Price: {live_price})")
-        return None
+    if len(highs) < 2 or len(lows) < 2: return None
 
     rsi_val = calculate_rsi(df_15m).iloc[-1]
     adx_val = calculate_adx(df_15m)
@@ -186,24 +181,18 @@ def analyze_symbol(yf_symbol):
 
     direction = None
     if live_price > highs[-1] and live_price > ema50_1h and rsi_val < 65 and adx_val > 20:
-        direction = "LONG"
+        direction = "BUY 🟢"
     elif live_price < lows[-1] and live_price < ema50_1h and rsi_val > 35 and adx_val > 20:
-        direction = "SHORT"
+        direction = "SELL 🔴"
 
-    if not direction:
-        logging.info(f"[{display_name}] Scanned: Price={live_price} | RSI={rsi_val:.1f} | ADX={adx_val:.1f} | Status=No Setup")
-        return None
+    if not direction: return None
 
-    stop, tp1, tp2, tp3, rr, lot_matrix = calculate_trade_setup(display_name, live_price, direction, df_15m)
-    if rr < MIN_RR_RATIO: 
-        logging.info(f"[{display_name}] Skipped: Low R:R Ratio ({rr})")
-        return None
+    stop, tp1, tp2, tp3, rr = calculate_trade_setup(display_name, live_price, direction, df_15m)
+    if rr < MIN_RR_RATIO: return None
 
-    logging.info(f"[{display_name}] !!! SIGNAL FOUND !!! Direction={direction} Entry={live_price}")
     return {
         "symbol": display_name, "direction": direction, "entry": live_price,
-        "stop": stop, "tp1": tp1, "tp2": tp2, "tp3": tp3,
-        "rr": rr, "lot_matrix": lot_matrix
+        "stop": stop, "tp1": tp1, "tp2": tp2, "tp3": tp3, "rr": rr
     }
 
 def track_active_trades():
@@ -214,49 +203,41 @@ def track_active_trades():
 
         current_price = df['close'].iloc[-1]
         
-        if trade['direction'] == "LONG":
+        if "BUY" in trade['direction']:
             if not trade.get('tp1_hit') and current_price >= trade['tp1']:
                 trade['tp1_hit'] = True
-                send_telegram_direct(
-                    f"TP1 Hit: {symbol_name}\n"
-                    f"Target 1 Reached: {format_price(symbol_name, trade['tp1'])}\n"
-                    f"Action: Move Stop Loss to Entry ({format_price(symbol_name, trade['entry'])})"
-                )
+                send_telegram_direct(f"🎯 *TP1 Hit:* `{symbol_name}` @ `{format_price(symbol_name, trade['tp1'])}` (Move SL to Entry)")
             elif current_price <= trade['stop']:
-                send_telegram_direct(f"Stop Loss Hit: {symbol_name}\nTrade closed at {format_price(symbol_name, trade['stop'])}")
+                send_telegram_direct(f"🛑 *SL Hit:* `{symbol_name}` @ `{format_price(symbol_name, trade['stop'])}`")
                 del active_trades[symbol_name]
 
-        elif trade['direction'] == "SHORT":
+        elif "SELL" in trade['direction']:
             if not trade.get('tp1_hit') and current_price <= trade['tp1']:
                 trade['tp1_hit'] = True
-                send_telegram_direct(
-                    f"TP1 Hit: {symbol_name}\n"
-                    f"Target 1 Reached: {format_price(symbol_name, trade['tp1'])}\n"
-                    f"Action: Move Stop Loss to Entry ({format_price(symbol_name, trade['entry'])})"
-                )
+                send_telegram_direct(f"🎯 *TP1 Hit:* `{symbol_name}` @ `{format_price(symbol_name, trade['tp1'])}` (Move SL to Entry)")
             elif current_price >= trade['stop']:
-                send_telegram_direct(f"Stop Loss Hit: {symbol_name}\nTrade closed at {format_price(symbol_name, trade['stop'])}")
+                send_telegram_direct(f"🛑 *SL Hit:* `{symbol_name}` @ `{format_price(symbol_name, trade['stop'])}`")
                 del active_trades[symbol_name]
 
 def main():
-    welcome_msg = (
-        "Forex & Gold Engine V50.5 Active!\n\n"
-        "Status: System Online and connected to Railway.\n"
-        "Waiting for high-probability setups..."
-    )
-    send_telegram_direct(welcome_msg)
+    global last_report_time
+    send_telegram_direct("🚀 *Forex Bot Active!*")
 
     while True:
         try:
+            current_time = time.time()
+            
+            if current_time - last_report_time > REPORT_INTERVAL:
+                send_periodic_market_report()
+                last_report_time = current_time
+
             track_active_trades()
             
-            logging.info("-------------------- STARTING SCAN --------------------")
             for yf_symbol in SYMBOL_MAP.keys():
                 now_ts = time.time()
                 display_name = SYMBOL_MAP[yf_symbol]
 
                 if display_name in signaled_history and (now_ts - signaled_history[display_name]) < (COOLDOWN_HOURS * 3600):
-                    logging.info(f"[{display_name}] Cooldown Active")
                     continue
 
                 trade = analyze_symbol(yf_symbol)
@@ -265,23 +246,27 @@ def main():
                     active_trades[display_name] = trade
                     
                     msg = (
-                        f"SIGNAL: {trade['symbol']} ({trade['direction']})\n\n"
-                        f"Entry Target: {format_price(trade['symbol'], trade['entry'])}\n\n"
-                        f"Take-Profit Targets:\n"
-                        f"1) {format_price(trade['symbol'], trade['tp1'])}\n"
-                        f"2) {format_price(trade['symbol'], trade['tp2'])}\n"
-                        f"3) {format_price(trade['symbol'], trade['tp3'])}\n\n"
-                        f"Stop Target:\n"
-                        f"1) {format_price(trade['symbol'], trade['stop'])}\n\n"
-                        f"----------------------------------------\n"
-                        f"Recommended Lot Sizes (1% Risk):\n"
-                        f"{trade['lot_matrix']}\n\n"
-                        f"Risk-Reward Ratio: {trade['rr']}:1\n"
-                        f"Time: {get_local_time()}"
+                        f"🚨 *SIGNAL:* `{trade['symbol']}` ({trade['direction']})\n\n"
+                        f"📍 *Entry:* `{format_price(trade['symbol'], trade['entry'])}`\n"
+                        f"🎯 *TP1:* `{format_price(trade['symbol'], trade['tp1'])}`\n"
+                        f"🎯 *TP2:* `{format_price(trade['symbol'], trade['tp2'])}`\n"
+                        f"🎯 *TP3:* `{format_price(trade['symbol'], trade['tp3'])}`\n"
+                        f"🛑 *SL:* `{format_price(trade['symbol'], trade['stop'])}`\n\n"
+                        f"⚖️ *R:R:* `{trade['rr']}` | ⏰ `{get_local_time()}`"
                     )
-                    send_telegram_direct(msg)
 
-            logging.info("-------------------- SCAN COMPLETED --------------------\n")
+                    # إضافة زر ينقلك لميتاترايدر مباشرة
+                    keyboard = {
+                        "inline_keyboard": [
+                            [
+                                {"text": "📲 Open MetaTrader 5", "url": "metatrader5://"},
+                                {"text": "📲 Open MetaTrader 4", "url": "metatrader4://"}
+                            ]
+                        ]
+                    }
+
+                    send_telegram_direct(msg, reply_markup=keyboard)
+
             time.sleep(CHECK_INTERVAL)
         except Exception as e:
             logging.error(f"Main Loop Error: {e}")
