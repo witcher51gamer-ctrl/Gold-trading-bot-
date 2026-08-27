@@ -1,6 +1,6 @@
 """
 ========================================================================================
-V50.0 Ultimate Cloud Forex & Gold Engine - Smart Tracking, News Guard & Session Filter
+V50.1 Ultimate Cloud Forex & Gold Engine - Fast Telegram Direct Dispatch
 ========================================================================================
 """
 
@@ -10,10 +10,9 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 from threading import Thread
-import aiohttp
-import aiosqlite
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 from flask import Flask
 
@@ -24,7 +23,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '8664695982:AAHMaTwCbX1aV1sZjKlie1jK5zJB4tXFSVo')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '6435071066')
 
-# الأزواج المستهدفة
 SYMBOL_MAP = {
     "GC=F": "XAUUSD",
     "EURUSD=X": "EURUSD",
@@ -32,7 +30,6 @@ SYMBOL_MAP = {
     "JPY=X": "USDJPY"
 }
 
-DATABASE = 'forex_signals_v50.db'
 CHECK_INTERVAL = 20
 MIN_RR_RATIO = 2.5
 COOLDOWN_HOURS = 4.0
@@ -40,8 +37,7 @@ RISK_PER_TRADE = 0.01
 
 LOCAL_TZ = timezone(timedelta(hours=3))
 signaled_history = {}
-active_trades = {}  # لمتابعة التوصيات المفتوحة
-http_session = None
+active_trades = {}
 
 # ======================================================================================== #
 # 1. FLASK KEEP-ALIVE
@@ -58,16 +54,8 @@ def keep_alive():
     t.start()
 
 # ======================================================================================== #
-# 2. إدارة قاعدة البيانات والتليجرام
+# 2. إرسال التليجرام المباشر والسريع
 # ======================================================================================== #
-async def init_database():
-    async with aiosqlite.connect(DATABASE) as conn:
-        await conn.execute("PRAGMA journal_mode=WAL;")
-        await conn.execute('''CREATE TABLE IF NOT EXISTS trades 
-            (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, direction TEXT, entry REAL, stop REAL, 
-             tp1 REAL, tp2 REAL, tp3 REAL, timestamp TEXT, status TEXT)''')
-        await conn.commit()
-
 def get_local_time():
     return datetime.now(LOCAL_TZ).strftime("%I:%M %p")
 
@@ -76,20 +64,24 @@ def format_price(symbol, price):
     elif "XAU" in symbol or "GC=F" in symbol: return f"{price:.2f}"
     else: return f"{price:.5f}"
 
-async def send_telegram(message):
-    global http_session
+def send_telegram_direct(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
     try:
-        if http_session is None or http_session.closed:
-            http_session = aiohttp.ClientSession()
-        async with http_session.post(url, json=payload, timeout=8) as resp:
-            return await resp.json()
+        res = requests.post(url, json=payload, timeout=10)
+        logging.info(f"Telegram Direct Send Status: {res.status_code}")
+        return res.json()
     except Exception as e:
-        logging.error(f"Telegram Error: {e}")
+        logging.error(f"Telegram Direct Error: {e}")
+        return None
 
 # ======================================================================================== #
-# 3. فحص جلسات التداول وتصفية التقلبات الشديدة (News Guard)
+# 3. فحص الجلسات والتقلبات
 # ======================================================================================== #
 def is_valid_session():
     now_utc = datetime.now(timezone.utc).hour
@@ -102,7 +94,7 @@ def check_volatility_spike(df):
     return last_candle_body > (atr * 2.8)
 
 # ======================================================================================== #
-# 4. جلب البيانات وتحليل المؤشرات
+# 4. جلب البيانات والمؤشرات
 # ======================================================================================== #
 def fetch_candles(yf_symbol, timeframe="15m", period="5d"):
     try:
@@ -180,14 +172,14 @@ def calculate_trade_setup(symbol, entry, direction, df_15m):
     return stop, tp1, tp2, tp3, round(rr, 2), lot_matrix
 
 # ======================================================================================== #
-# 5. تحليل الفرص ومتابعة الصفقات المفتوحة
+# 5. تحليل الفرص ومتابعة الصفقات
 # ======================================================================================== #
-async def analyze_symbol(yf_symbol):
+def analyze_symbol(yf_symbol):
     if not is_valid_session(): return None
     
     display_name = SYMBOL_MAP[yf_symbol]
-    df_15m = await asyncio.to_thread(fetch_candles, yf_symbol, "15m", "5d")
-    df_1h = await asyncio.to_thread(fetch_candles, yf_symbol, "1h", "7d")
+    df_15m = fetch_candles(yf_symbol, "15m", "5d")
+    df_1h = fetch_candles(yf_symbol, "1h", "7d")
     
     if df_15m is None or df_1h is None or len(df_15m) < 30: return None
     if check_volatility_spike(df_15m): return None
@@ -217,68 +209,53 @@ async def analyze_symbol(yf_symbol):
         "rr": rr, "lot_matrix": lot_matrix
     }
 
-async def track_active_trades():
-    """ تعقب التوصيات وإرسال تنبيهات التحديث أوتوماتيكياً """
+def track_active_trades():
     for symbol_name, trade in list(active_trades.items()):
         yf_symbol = [k for k, v in SYMBOL_MAP.items() if v == symbol_name][0]
-        df = await asyncio.to_thread(fetch_candles, yf_symbol, "1m", "1d")
+        df = fetch_candles(yf_symbol, "1m", "1d")
         if df is None or df.empty: continue
 
         current_price = df['close'].iloc[-1]
         
-        # حالة صفقات الشراء LONG
         if trade['direction'] == "LONG":
             if not trade.get('tp1_hit') and current_price >= trade['tp1']:
                 trade['tp1_hit'] = True
-                await send_telegram(
+                send_telegram_direct(
                     f"🎯 <b>{symbol_name} - TP1 Hit!</b>\n"
                     f"✅ تم تحقيق الهدف الأول عند {format_price(symbol_name, trade['tp1'])}\n"
-                    f"🛡 <b>إجراء مطلوب:</b> انقل الوقف إلى سعر الدخول ({format_price(symbol_name, trade['entry'])}) لتأمين الصفقة (Break-Even)."
+                    f"🛡 <b>إجراء مطلوب:</b> انقل الوقف إلى سعر الدخول ({format_price(symbol_name, trade['entry'])}) لتأمين الصفقة."
                 )
-            elif not trade.get('tp2_hit') and current_price >= trade['tp2']:
-                trade['tp2_hit'] = True
-                await send_telegram(f"🎉 <b>{symbol_name} - TP2 Hit!</b>\n✅ تم تحقيق الهدف الثاني عند {format_price(symbol_name, trade['tp2'])}")
             elif current_price <= trade['stop']:
-                await send_telegram(f"🛑 <b>{symbol_name} - Stop Loss Hit</b>\nتم إغلاق الصفقة عند {format_price(symbol_name, trade['stop'])}")
+                send_telegram_direct(f"🛑 <b>{symbol_name} - Stop Loss Hit</b>\nتم إغلاق الصفقة عند {format_price(symbol_name, trade['stop'])}")
                 del active_trades[symbol_name]
 
-        # حالة صفقات البيع SHORT
         elif trade['direction'] == "SHORT":
             if not trade.get('tp1_hit') and current_price <= trade['tp1']:
                 trade['tp1_hit'] = True
-                await send_telegram(
+                send_telegram_direct(
                     f"🎯 <b>{symbol_name} - TP1 Hit!</b>\n"
                     f"✅ تم تحقيق الهدف الأول عند {format_price(symbol_name, trade['tp1'])}\n"
-                    f"🛡 <b>إجراء مطلوب:</b> انقل الوقف إلى سعر الدخول ({format_price(symbol_name, trade['entry'])}) لتأمين الصفقة (Break-Even)."
+                    f"🛡 <b>إجراء مطلوب:</b> انقل الوقف إلى سعر الدخول ({format_price(symbol_name, trade['entry'])}) لتأمين الصفقة."
                 )
-            elif not trade.get('tp2_hit') and current_price <= trade['tp2']:
-                trade['tp2_hit'] = True
-                await send_telegram(f"🎉 <b>{symbol_name} - TP2 Hit!</b>\n✅ تم تحقيق الهدف الثاني عند {format_price(symbol_name, trade['tp2'])}")
             elif current_price >= trade['stop']:
-                await send_telegram(f"🛑 <b>{symbol_name} - Stop Loss Hit</b>\nتم إغلاق الصفقة عند {format_price(symbol_name, trade['stop'])}")
+                send_telegram_direct(f"🛑 <b>{symbol_name} - Stop Loss Hit</b>\nتم إغلاق الصفقة عند {format_price(symbol_name, trade['stop'])}")
                 del active_trades[symbol_name]
 
 # ======================================================================================== #
-# 6. المحرك الرئيسي
+# 6. التشغيل والمحرك الرئيسي
 # ======================================================================================== #
-async def main():
-    await init_database()
-    
-    # رسالة الترحيب والتشغيل المحدثة
+def main():
     welcome_msg = (
-        "<b>Welcome to Forex & Gold Engine V50.0!</b>\n\n"
-        "<b>Status:</b> Engine Active & Running on Railway\n"
-        "<b>Features Enabled:</b>\n"
-        "• Smart Trade Tracking (Live TP/SL Alerts)\n"
-        "• Dynamic Lot Size Matrix ($10 to $10,000)\n"
-        "• Session & News Guard Active\n\n"
-        "Ready to send high-probability trading setups."
+        "<b>Welcome to Forex & Gold Engine V50.1!</b>\n\n"
+        "<b>Status:</b> Engine Active & Connected Successfully!\n"
+        "<b>Features:</b> Live Trade Tracking, Session Filter & Risk Matrix Active."
     )
-    await send_telegram(welcome_msg)
+    # إرسال الرسالة فوراً عند بداية التسهيل
+    send_telegram_direct(welcome_msg)
 
     while True:
         try:
-            await track_active_trades()
+            track_active_trades()
             
             for yf_symbol in SYMBOL_MAP.keys():
                 now_ts = time.time()
@@ -287,7 +264,7 @@ async def main():
                 if display_name in signaled_history and (now_ts - signaled_history[display_name]) < (COOLDOWN_HOURS * 3600):
                     continue
 
-                trade = await analyze_symbol(yf_symbol)
+                trade = analyze_symbol(yf_symbol)
                 if trade:
                     signaled_history[display_name] = now_ts
                     active_trades[display_name] = trade
@@ -308,13 +285,13 @@ async def main():
                         f"📊 <b>Risk-Reward:</b> {trade['rr']}:1\n"
                         f"⏰ <b>Time:</b> {get_local_time()}"
                     )
-                    await send_telegram(msg)
+                    send_telegram_direct(msg)
 
-            await asyncio.sleep(CHECK_INTERVAL)
+            time.sleep(CHECK_INTERVAL)
         except Exception as e:
             logging.error(f"Main Loop Error: {e}")
-            await asyncio.sleep(CHECK_INTERVAL)
+            time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
     keep_alive()
-    asyncio.run(main())
+    main()
