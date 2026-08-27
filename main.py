@@ -1,6 +1,6 @@
 """
 ========================================================================================
-V50.5 Master Forex & Gold Engine - Ultra Gold Precision & Full Market Scanner
+V51.0 Master Forex & Gold Cloud Engine - Ultra Precision & News Aware
 ========================================================================================
 """
 
@@ -25,22 +25,19 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '8664695982:AAHMaTwCbX1aV1sZjKlie1jK5zJB4tXFSVo')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '6021016826')
 
-# 🎯 إعدادات الفريمات والقوة (مطابقة لكود العملات الرقمية)
 TIMEFRAME_PRIMARY = "15m"   # فريم الدخول الأساسي
 TIMEFRAME_CONFIRM = "1h"    # فريم التأكيد الاتجاهي
-DATABASE = 'forex_master_signals_v50.db'
+DATABASE = 'forex_master_signals_v51.db'
 
 CHECK_INTERVAL = 15
 BATCH_SIZE = 4
 BATCH_DELAY = 1.0
 
-# ⚙️ المعايير الصارمة للفلترة والتقييم
 SIGNAL_THRESHOLD = 95       # عتبة قوة الإشارة العالية
 MIN_RR_RATIO = 2.5           # حد أدنى للعائد مقابل المخاطرة
 MAX_ACTIVE_TRADES = 8        # أقصى عدد صفقات نشطة
 COOLDOWN_HOURS = 6.0         # فترة الانتظار لتكرار نفس الزوج
 
-# خريطة الأصول الشاملة (الذهب والمعادن والأزواج الرئيسية والفرعية)
 SYMBOL_MAP = {
     "GC=F": "XAU/USD",       # الذهب
     "SI=F": "XAG/USD",       # الفضة
@@ -62,6 +59,7 @@ signaled_history = {}
 active_live_trades = {}
 http_session = None
 last_telegram_update_id = 0
+news_blackout = False
 
 # ========================================================================================
 # 1. خادم FLASK (KEEP-ALIVE SERVER)
@@ -70,7 +68,7 @@ app = Flask('')
 
 @app.route('/', methods=['GET', 'HEAD', 'POST'])
 def home():
-    return "V50.5 Forex & Gold Ultra Precision Engine is ALIVE!", 200
+    return "V51.0 Forex & Gold Ultra Precision Cloud Engine is ALIVE!", 200
 
 def run_server():
     port = int(os.getenv('PORT', 8000))
@@ -82,7 +80,36 @@ def keep_alive():
     t.start()
 
 # ========================================================================================
-# 2. إدارة قاعدة البيانات (DATABASE HELPERS)
+# 2. فلتر الأخبار الاقتصادية المتقدم (ECONOMIC NEWS FILTER)
+# ========================================================================================
+async def check_economic_news():
+    """يفحص تقويم الأخبار الاقتصادية لمنع التداول قبل وبعد الأخبار القوية بـ 30 دقيقة"""
+    global news_blackout, http_session
+    url = "https://nws.mql5.com/news/v2/en/news.json" # مصدر إخباري سريع مجاني
+    try:
+        if http_session is None or http_session.closed:
+            http_session = aiohttp.ClientSession()
+        async with http_session.get(url, timeout=5) as response:
+            if response.status == 200:
+                data = await response.json()
+                now = datetime.now(timezone.utc)
+                for item in data[:10]:
+                    importance = item.get("importance", 0)
+                    news_time_str = item.get("time")
+                    if importance >= 3 and news_time_str:
+                        news_time = datetime.fromisoformat(news_time_str.replace("Z", "+00:00"))
+                        time_diff = abs((news_time - now).total_seconds()) / 60
+                        if time_diff <= 30: # حظر التداول ضمن نطاق 30 دقيقة
+                            news_blackout = True
+                            logging.warning(f"⚠️ حظر التداول مفعل بسبب خبر اقتصادي هام: {item.get('title')}")
+                            return True
+    except Exception as e:
+        logging.error(f"خطأ أثناء فحص تقويم الأخبار: {e}")
+    news_blackout = False
+    return False
+
+# ========================================================================================
+# 3. إدارة قاعدة البيانات (DATABASE HELPERS)
 # ========================================================================================
 async def init_database():
     async with aiosqlite.connect(DATABASE) as conn:
@@ -153,7 +180,7 @@ async def get_performance_summary():
         }
 
 # ========================================================================================
-# 3. الأدوات والتنبيهات للتليجرام
+# 4. الأدوات والتنبيهات للتليجرام
 # ========================================================================================
 def get_local_time():
     return datetime.now(LOCAL_TZ).strftime("%I:%M %p")
@@ -232,12 +259,16 @@ async def telegram_command_listener():
                         command = text.split('@')[0].lower() if text.startswith('/') else text.lower()
                         if command in ["/start", "/help"]:
                             reply = (
-                                f"🔱 <b>V50.5 Forex & Gold Ultra Engine</b> (Strict Threshold: {SIGNAL_THRESHOLD})\n\n"
+                                f"🔱 <b>V51.0 Forex & Gold Ultra Engine</b> (Strict Threshold: {SIGNAL_THRESHOLD})\n\n"
                                 f"• /status - ملخص الأداء القياسي والأرباح\n"
                                 f"• /active - الصفقات النشطة والمفتوحة حالياً\n"
+                                f"• /news - حالة حظر الأخبار الاقتصادية\n"
                                 f"• /help - قائمة الأوامر المتاحة"
                             )
                             await send_telegram(reply, include_mt_buttons=False)
+                        elif command == "/news":
+                            state = "⚠️ حظر مفعل (خبر قريب)" if news_blackout else "🟢 السوق آمن للتداول"
+                            await send_telegram(f"📰 <b>News Status:</b> {state}", include_mt_buttons=False)
                         elif command == "/status":
                             stats = await get_performance_summary()
                             total = stats["total"]
@@ -272,7 +303,7 @@ async def telegram_command_listener():
         await asyncio.sleep(3)
 
 # ========================================================================================
-# 4. جلب البيانات ومؤشرات التحليل الفني الصارمة
+# 5. جلب البيانات ومؤشرات التحليل الفني الصارمة
 # ========================================================================================
 async def fetch_candles_async(yf_symbol, timeframe="15m", period="5d"):
     def _fetch():
@@ -357,7 +388,12 @@ def calculate_dynamic_sl_tp(symbol, live_entry, direction, df_15m):
     if pd.isna(atr) or atr == 0: atr = live_entry * 0.002
 
     highs, lows = find_swing_points(df_15m, length=7)
-    atr_buffer = atr * 1.2
+    
+    # ⚡️ تخصيص نطاق أوسع للذهب والمعادن لتفادي الذيول السريعة (Spikes)
+    is_gold_or_oil = "XAU" in symbol or "XAG" in symbol or "OIL" in symbol
+    multiplier = 2.2 if is_gold_or_oil else 1.2
+    spread_buffer = atr * 0.3 if is_gold_or_oil else 0.0
+    atr_buffer = (atr * multiplier) + spread_buffer
 
     if "BUY" in direction or "LONG" in direction:
         recent_low = lows[-1]["price"] if lows else (live_entry - atr * 2.0)
@@ -390,13 +426,15 @@ def calculate_score(direction, structure_15m, sweep_15m, volume_ok):
 
     if volume_ok: score += 30
     if sweep_15m != "NONE": score += 20
-    score += 15  # إعطاء النقاط عند توافق الفريمين
+    score += 15  
     return max(0, score)
 
 # ========================================================================================
-# 5. محرك التحليل الشامل لجميع الأزواج والذهب
+# 6. محرك التحليل الشامل لجميع الأزواج والذهب
 # ========================================================================================
 async def analyze_symbol(yf_symbol):
+    if news_blackout: return None # إيقاف الفحص أثناء الأخبار
+
     display_name = SYMBOL_MAP[yf_symbol]
     now_ts = time.time()
     
@@ -438,7 +476,7 @@ async def analyze_symbol(yf_symbol):
     if "BUY" in direction and not (50.0 <= live_rsi <= 70.0): return None
     if "SELL" in direction and not (30.0 <= live_rsi <= 50.0): return None
 
-    # 4. فلتر المتوسطات EMA20 و EMA200 على فريم الساعة (التأكيد)
+    # 4. فلتر المتوسطات EMA20 و EMA200 على فريم الساعة
     ema20_1h = df_1h['close'].ewm(span=20, adjust=False).mean().iloc[-1]
     ema200_1h = df_1h['close'].ewm(span=200, adjust=False).mean().iloc[-1]
 
@@ -448,7 +486,6 @@ async def analyze_symbol(yf_symbol):
     stop, tp1, tp2, tp3, rr = calculate_dynamic_sl_tp(display_name, live_price, direction, df_15m)
     score = calculate_score(direction, structure_15m, sweep_15m, volume_ok)
 
-    # التطبيق الصارم للشرط القياسي (95 نقطة)
     if score < SIGNAL_THRESHOLD or rr < MIN_RR_RATIO: return None
 
     return {
@@ -458,7 +495,7 @@ async def analyze_symbol(yf_symbol):
     }
 
 # ========================================================================================
-# 6. المتابعة التلقائية المباشرة للصفقات المفتوحة
+# 7. المتابعة التلقائية المباشرة للصفقات المفتوحة
 # ========================================================================================
 async def monitor_trades_loop():
     while True:
@@ -538,16 +575,16 @@ async def monitor_trades_loop():
         await asyncio.sleep(CHECK_INTERVAL)
 
 # ========================================================================================
-# 7. الحلقة التشغيلية الرئيسية
+# 8. الحلقة التشغيلية الرئيسية
 # ========================================================================================
 async def main():
     await init_database()
     await reload_active_trades()
     
     await send_telegram(
-        f"🚀 <b>V50.5 Forex & Gold Engine Active!</b>\n"
+        f"🚀 <b>V51.0 Forex & Gold Cloud Engine Active!</b>\n"
         f"• Strict Threshold: <b>{SIGNAL_THRESHOLD}</b> | Min R:R: <b>{MIN_RR_RATIO}</b>\n"
-        f"• SMC/ICT Liquidity & Multi-Timeframe Filters Active\n"
+        f"• News Filter & Dynamic Gold Spreads Active 📰\n"
         f"• Direct MetaTrader Buttons Included 📲", 
         include_mt_buttons=False
     )
@@ -559,7 +596,10 @@ async def main():
 
     while True:
         try:
-            if len(active_live_trades) < MAX_ACTIVE_TRADES:
+            # فحص تقويم الأخبار
+            await check_economic_news()
+
+            if len(active_live_trades) < MAX_ACTIVE_TRADES and not news_blackout:
                 for i in range(0, len(symbols), BATCH_SIZE):
                     if len(active_live_trades) >= MAX_ACTIVE_TRADES: break
                     batch = symbols[i:i + BATCH_SIZE]
@@ -614,7 +654,7 @@ if __name__ == "__main__":
     keep_alive()
     while True:
         try:
-            print("\n🚀 Starting V50.5 Forex & Gold Ultra Precision Engine...")
+            print("\n🚀 Starting V51.0 Forex & Gold Cloud Engine...")
             asyncio.run(main())
         except KeyboardInterrupt:
             break
