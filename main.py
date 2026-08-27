@@ -1,6 +1,6 @@
 """
 ========================================================================================
-V50.4 Ultimate Cloud Forex & Gold Engine - Fixed Telegram Chat ID
+V50.5 Ultimate Cloud Forex & Gold Engine - Live Scan Logging
 ========================================================================================
 """
 
@@ -18,7 +18,6 @@ from flask import Flask
 # --- إعدادات التسجيل ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- بيانات التليجرام الصحيحة ---
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '8664695982:AAHMaTwCbX1aV1sZjKlie1jK5zJB4tXFSVo')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '6021016826')
 
@@ -38,9 +37,6 @@ LOCAL_TZ = timezone(timedelta(hours=3))
 signaled_history = {}
 active_trades = {}
 
-# ======================================================================================== #
-# 1. FLASK KEEP-ALIVE
-# ======================================================================================== #
 app = Flask('')
 
 @app.route('/')
@@ -52,9 +48,6 @@ def keep_alive():
     t.daemon = True
     t.start()
 
-# ======================================================================================== #
-# 2. إرسال التليجرام المباشر (Plain Text)
-# ======================================================================================== #
 def get_local_time():
     return datetime.now(LOCAL_TZ).strftime("%I:%M %p")
 
@@ -72,15 +65,12 @@ def send_telegram_direct(message):
     }
     try:
         res = requests.post(url, json=payload, timeout=10)
-        logging.info(f"Telegram Direct Send Status: {res.status_code} - Response: {res.text}")
+        logging.info(f"Telegram Direct Send Status: {res.status_code}")
         return res.json()
     except Exception as e:
         logging.error(f"Telegram Direct Error: {e}")
         return None
 
-# ======================================================================================== #
-# 3. فحص الجلسات والتقلبات
-# ======================================================================================== #
 def is_valid_session():
     now_utc = datetime.now(timezone.utc).hour
     return 7 <= now_utc <= 21
@@ -91,9 +81,6 @@ def check_volatility_spike(df):
     last_candle_body = abs(df['close'].iloc[-1] - df['open'].iloc[-1])
     return last_candle_body > (atr * 2.8)
 
-# ======================================================================================== #
-# 4. جلب البيانات والمؤشرات
-# ======================================================================================== #
 def fetch_candles(yf_symbol, timeframe="15m", period="5d"):
     try:
         ticker = yf.Ticker(yf_symbol)
@@ -169,22 +156,29 @@ def calculate_trade_setup(symbol, entry, direction, df_15m):
     lot_matrix = calculate_lot_matrix(entry, stop, symbol)
     return stop, tp1, tp2, tp3, round(rr, 2), lot_matrix
 
-# ======================================================================================== #
-# 5. تحليل الفرص ومتابعة الصفقات
-# ======================================================================================== #
 def analyze_symbol(yf_symbol):
-    if not is_valid_session(): return None
-    
     display_name = SYMBOL_MAP[yf_symbol]
+    
+    if not is_valid_session(): 
+        logging.info(f"[{display_name}] Skipped: Outside Trading Hours")
+        return None
+    
     df_15m = fetch_candles(yf_symbol, "15m", "5d")
     df_1h = fetch_candles(yf_symbol, "1h", "7d")
     
-    if df_15m is None or df_1h is None or len(df_15m) < 30: return None
-    if check_volatility_spike(df_15m): return None
+    if df_15m is None or df_1h is None or len(df_15m) < 30: 
+        logging.info(f"[{display_name}] Skipped: Insufficient Data")
+        return None
+        
+    if check_volatility_spike(df_15m): 
+        logging.info(f"[{display_name}] Skipped: Volatility Spike Detected")
+        return None
 
     live_price = float(df_15m['close'].iloc[-1])
     highs, lows = find_swings(df_15m)
-    if len(highs) < 2 or len(lows) < 2: return None
+    if len(highs) < 2 or len(lows) < 2: 
+        logging.info(f"[{display_name}] Skipped: No Clear Swing Pattern (Price: {live_price})")
+        return None
 
     rsi_val = calculate_rsi(df_15m).iloc[-1]
     adx_val = calculate_adx(df_15m)
@@ -196,11 +190,16 @@ def analyze_symbol(yf_symbol):
     elif live_price < lows[-1] and live_price < ema50_1h and rsi_val > 35 and adx_val > 20:
         direction = "SHORT"
 
-    if not direction: return None
+    if not direction:
+        logging.info(f"[{display_name}] Scanned: Price={live_price} | RSI={rsi_val:.1f} | ADX={adx_val:.1f} | Status=No Setup")
+        return None
 
     stop, tp1, tp2, tp3, rr, lot_matrix = calculate_trade_setup(display_name, live_price, direction, df_15m)
-    if rr < MIN_RR_RATIO: return None
+    if rr < MIN_RR_RATIO: 
+        logging.info(f"[{display_name}] Skipped: Low R:R Ratio ({rr})")
+        return None
 
+    logging.info(f"[{display_name}] !!! SIGNAL FOUND !!! Direction={direction} Entry={live_price}")
     return {
         "symbol": display_name, "direction": direction, "entry": live_price,
         "stop": stop, "tp1": tp1, "tp2": tp2, "tp3": tp3,
@@ -239,12 +238,9 @@ def track_active_trades():
                 send_telegram_direct(f"Stop Loss Hit: {symbol_name}\nTrade closed at {format_price(symbol_name, trade['stop'])}")
                 del active_trades[symbol_name]
 
-# ======================================================================================== #
-# 6. التشغيل والمحرك الرئيسي
-# ======================================================================================== #
 def main():
     welcome_msg = (
-        "Forex & Gold Engine V50.4 Active!\n\n"
+        "Forex & Gold Engine V50.5 Active!\n\n"
         "Status: System Online and connected to Railway.\n"
         "Waiting for high-probability setups..."
     )
@@ -254,11 +250,13 @@ def main():
         try:
             track_active_trades()
             
+            logging.info("-------------------- STARTING SCAN --------------------")
             for yf_symbol in SYMBOL_MAP.keys():
                 now_ts = time.time()
                 display_name = SYMBOL_MAP[yf_symbol]
 
                 if display_name in signaled_history and (now_ts - signaled_history[display_name]) < (COOLDOWN_HOURS * 3600):
+                    logging.info(f"[{display_name}] Cooldown Active")
                     continue
 
                 trade = analyze_symbol(yf_symbol)
@@ -283,6 +281,7 @@ def main():
                     )
                     send_telegram_direct(msg)
 
+            logging.info("-------------------- SCAN COMPLETED --------------------\n")
             time.sleep(CHECK_INTERVAL)
         except Exception as e:
             logging.error(f"Main Loop Error: {e}")
