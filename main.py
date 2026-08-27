@@ -1,6 +1,6 @@
 """
 ========================================================================================
-V50.0 Master Forex & Gold Engine - Ultra Async & Database Edition
+V50.5 Master Forex & Gold Engine - Ultra Gold Precision & Full Market Scanner
 ========================================================================================
 """
 
@@ -25,25 +25,37 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '8664695982:AAHMaTwCbX1aV1sZjKlie1jK5zJB4tXFSVo')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '6021016826')
 
-# خريطة الأصول المراد مسحها وتحليلها
+# 🎯 إعدادات الفريمات والقوة (مطابقة لكود العملات الرقمية)
+TIMEFRAME_PRIMARY = "15m"   # فريم الدخول الأساسي
+TIMEFRAME_CONFIRM = "1h"    # فريم التأكيد الاتجاهي
+DATABASE = 'forex_master_signals_v50.db'
+
+CHECK_INTERVAL = 15
+BATCH_SIZE = 4
+BATCH_DELAY = 1.0
+
+# ⚙️ المعايير الصارمة للفلترة والتقييم
+SIGNAL_THRESHOLD = 95       # عتبة قوة الإشارة العالية
+MIN_RR_RATIO = 2.5           # حد أدنى للعائد مقابل المخاطرة
+MAX_ACTIVE_TRADES = 8        # أقصى عدد صفقات نشطة
+COOLDOWN_HOURS = 6.0         # فترة الانتظار لتكرار نفس الزوج
+
+# خريطة الأصول الشاملة (الذهب والمعادن والأزواج الرئيسية والفرعية)
 SYMBOL_MAP = {
-    "GC=F": "XAU/USD",
+    "GC=F": "XAU/USD",       # الذهب
+    "SI=F": "XAG/USD",       # الفضة
+    "CL=F": "USOIL",         # النفط
     "EURUSD=X": "EUR/USD",
     "GBPUSD=X": "GBP/USD",
     "USDJPY=X": "USD/JPY",
     "AUDUSD=X": "AUD/USD",
-    "USDCAD=X": "USD/CAD"
+    "USDCAD=X": "USD/CAD",
+    "USDCHF=X": "USD/CHF",
+    "NZDUSD=X": "NZD/USD",
+    "EURGBP=X": "EUR/GBP",
+    "EURJPY=X": "EUR/JPY",
+    "GBPJPY=X": "GBP/JPY"
 }
-
-TIMEFRAME_PRIMARY = "15m"
-TIMEFRAME_CONFIRM = "1h"
-DATABASE = 'forex_master_signals.db'
-
-CHECK_INTERVAL = 15
-SIGNAL_THRESHOLD = 80
-MIN_RR_RATIO = 2.5
-MAX_ACTIVE_TRADES = 5
-COOLDOWN_HOURS = 4.0
 
 LOCAL_TZ = timezone(timedelta(hours=3))
 signaled_history = {}
@@ -52,13 +64,13 @@ http_session = None
 last_telegram_update_id = 0
 
 # ========================================================================================
-# 1. خادم FLASK للحفاظ على استمرارية البوت (KEEP-ALIVE)
+# 1. خادم FLASK (KEEP-ALIVE SERVER)
 # ========================================================================================
 app = Flask('')
 
 @app.route('/', methods=['GET', 'HEAD', 'POST'])
 def home():
-    return "V50.0 Forex & Gold Master Engine is ALIVE!", 200
+    return "V50.5 Forex & Gold Ultra Precision Engine is ALIVE!", 200
 
 def run_server():
     port = int(os.getenv('PORT', 8000))
@@ -80,18 +92,18 @@ async def init_database():
             symbol TEXT, direction TEXT, entry REAL, stop REAL,
             tp1 REAL, tp2 REAL, tp3 REAL, timestamp TEXT,
             hit_tp1 BOOLEAN, hit_tp2 BOOLEAN, sl REAL, msg_id TEXT,
-            status TEXT, pnl REAL
+            status TEXT, pnl REAL, highest REAL, lowest REAL
         )''')
         await conn.commit()
 
 async def save_trade(trade):
     async with aiosqlite.connect(DATABASE) as conn:
         cursor = await conn.execute('''INSERT INTO trades 
-            (symbol, direction, entry, stop, tp1, tp2, tp3, timestamp, hit_tp1, hit_tp2, sl, status, pnl)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (symbol, direction, entry, stop, tp1, tp2, tp3, timestamp, hit_tp1, hit_tp2, sl, status, pnl, highest, lowest)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
             (trade['symbol'], trade['direction'], trade['entry'], trade['stop'],
              trade['tp1'], trade['tp2'], trade['tp3'], trade['timestamp'],
-             False, False, trade['stop'], 'OPEN', 0.0))
+             False, False, trade['stop'], 'OPEN', 0.0, trade['entry'], trade['entry']))
         await conn.commit()
         return cursor.lastrowid
 
@@ -105,6 +117,8 @@ async def reload_active_trades():
                 trade_dict = dict(row)
                 trade_dict['hit_tp1'] = bool(row['hit_tp1'])
                 trade_dict['hit_tp2'] = bool(row['hit_tp2'])
+                trade_dict['highest'] = row['highest'] if row['highest'] else row['entry']
+                trade_dict['lowest'] = row['lowest'] if row['lowest'] else row['entry']
                 active_live_trades[row['id']] = trade_dict
 
 async def update_trade_msg_id(row_id, msg_id):
@@ -112,10 +126,10 @@ async def update_trade_msg_id(row_id, msg_id):
         await conn.execute("UPDATE trades SET msg_id=? WHERE id=?", (str(msg_id), row_id))
         await conn.commit()
 
-async def update_trade_progress(trade_id, hit_tp1=False, hit_tp2=False, new_sl=None):
+async def update_trade_progress(trade_id, hit_tp1=False, hit_tp2=False, new_sl=None, highest=None, lowest=None):
     async with aiosqlite.connect(DATABASE) as conn:
-        await conn.execute("UPDATE trades SET hit_tp1=?, hit_tp2=?, sl=? WHERE id=?", 
-                           (hit_tp1, hit_tp2, new_sl, trade_id))
+        await conn.execute("UPDATE trades SET hit_tp1=?, hit_tp2=?, sl=?, highest=?, lowest=? WHERE id=?", 
+                           (hit_tp1, hit_tp2, new_sl, highest, lowest, trade_id))
         await conn.commit()
 
 async def update_trade(trade_id, status, pnl):
@@ -129,19 +143,37 @@ async def get_performance_summary():
             total, total_pnl = await cursor.fetchone()
         async with conn.execute("SELECT COUNT(*) FROM trades WHERE status LIKE '%WIN%' OR status = 'TRAIL_PROFIT'") as cursor:
             wins = (await cursor.fetchone())[0] or 0
-        return {"total": total or 0, "wins": wins, "total_pnl": total_pnl or 0.0}
+        async with conn.execute("SELECT symbol, pnl, direction FROM trades WHERE status != 'OPEN' ORDER BY pnl DESC LIMIT 1") as cursor:
+            best_trade = await cursor.fetchone()
+        return {
+            "total": total or 0,
+            "wins": wins,
+            "total_pnl": total_pnl or 0.0,
+            "best_trade": best_trade
+        }
 
 # ========================================================================================
-# 3. أدوات مساعدة وتنبيهات التليجرام التفاعلية
+# 3. الأدوات والتنبيهات للتليجرام
 # ========================================================================================
 def get_local_time():
     return datetime.now(LOCAL_TZ).strftime("%I:%M %p")
 
 def format_price(symbol, price):
-    if not price: return "0.00"
+    if not price or price == 0: return "0.00"
     if "JPY" in symbol: return f"{price:.3f}"
-    elif "XAU" in symbol or "GC=F" in symbol: return f"{price:.2f}"
+    elif "XAU" in symbol or "GC=F" in symbol or "OIL" in symbol: return f"{price:.2f}"
     else: return f"{price:.5f}"
+
+def format_duration(start_time_iso):
+    try:
+        start_time = datetime.fromisoformat(start_time_iso)
+        now = datetime.now(timezone.utc)
+        diff_seconds = int((now - start_time).total_seconds())
+        hours = diff_seconds // 3600
+        minutes = (diff_seconds % 3600) // 60
+        return f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
+    except Exception:
+        return "0m"
 
 async def send_telegram(message, reply_to_message_id=None, include_mt_buttons=True):
     global http_session
@@ -151,7 +183,7 @@ async def send_telegram(message, reply_to_message_id=None, include_mt_buttons=Tr
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
-        "parse_mode": "Markdown",
+        "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
     
@@ -173,7 +205,7 @@ async def send_telegram(message, reply_to_message_id=None, include_mt_buttons=Tr
             data = await response.json()
             return data.get("result", {}).get("message_id")
     except Exception as e:
-        logging.error(f"Telegram Send Error: {e}")
+        logging.error(f"Telegram Send Exception: {e}")
         return None
 
 async def telegram_command_listener():
@@ -197,13 +229,13 @@ async def telegram_command_listener():
                         
                         if chat_id != TELEGRAM_CHAT_ID: continue
                         
-                        command = text.lower()
+                        command = text.split('@')[0].lower() if text.startswith('/') else text.lower()
                         if command in ["/start", "/help"]:
                             reply = (
-                                f"🔱 *V50.0 Forex & Gold Master Engine*\n\n"
-                                f"• `/status` - ملخص أداء الأرباح والصفقات المغلقة\n"
-                                f"• `/active` - الصفقات النشطة والمفتوحة حالياً\n"
-                                f"• `/help` - قائمة الأوامر"
+                                f"🔱 <b>V50.5 Forex & Gold Ultra Engine</b> (Strict Threshold: {SIGNAL_THRESHOLD})\n\n"
+                                f"• /status - ملخص الأداء القياسي والأرباح\n"
+                                f"• /active - الصفقات النشطة والمفتوحة حالياً\n"
+                                f"• /help - قائمة الأوامر المتاحة"
                             )
                             await send_telegram(reply, include_mt_buttons=False)
                         elif command == "/status":
@@ -212,36 +244,42 @@ async def telegram_command_listener():
                             wins = stats["wins"]
                             pnl = stats["total_pnl"]
                             win_rate = (wins / total * 100) if total > 0 else 0
+                            best_info = "لا يوجد"
+                            if stats["best_trade"] and stats["best_trade"][0]:
+                                best_info = f"#{stats['best_trade'][0]} (+{stats['best_trade'][1]:.1f}R)"
+                            
                             reply = (
-                                f"📊 *Forex & Gold Performance Summary*\n"
+                                f"📊 <b>Forex & Gold Performance Summary</b>\n"
                                 f"━━━━━━━━━━━━━━━\n"
-                                f"• Active Trades: `{len(active_live_trades)} / {MAX_ACTIVE_TRADES}`\n"
-                                f"• Closed Signals: `{total}` | Win Rate: `{win_rate:.1f}%`\n"
-                                f"• Net Profit Ratio: `{pnl:+.2f}R`\n"
-                                f"⏰ Time: `{get_local_time()}`"
+                                f"• Active Trades: <code>{len(active_live_trades)} / {MAX_ACTIVE_TRADES}</code>\n"
+                                f"• Total Signals: <code>{total}</code> | Win Rate: <code>{win_rate:.1f}%</code>\n"
+                                f"• Net Profit Ratio: <code>{pnl:+.2f}R</code>\n"
+                                f"• 🏆 Top Trade: <b>{best_info}</b>\n"
+                                f"⏰ Time: <code>{get_local_time()}</code>"
                             )
                             await send_telegram(reply, include_mt_buttons=False)
                         elif command == "/active":
                             if not active_live_trades:
                                 await send_telegram("ℹ️ لا توجد توصيات مفتوحة حالياً.", include_mt_buttons=False)
                             else:
-                                reply = "🔥 *Active Forex Signals:*\n\n"
+                                reply = "🔥 <b>Active Signals:</b>\n\n"
                                 for tid, tr in active_live_trades.items():
-                                    reply += f"• *{tr['symbol']}* ({tr['direction']}) | Entry: `{format_price(tr['symbol'], tr['entry'])}` | SL: `{format_price(tr['symbol'], tr['sl'])}`\n"
+                                    dur = format_duration(tr['timestamp'])
+                                    reply += f"• <b>#{tr['symbol']}</b> ({tr['direction']}) | Entry: <code>{format_price(tr['symbol'], tr['entry'])}</code> | SL: <code>{format_price(tr['symbol'], tr['sl'])}</code> | ⏱ {dur}\n"
                                 await send_telegram(reply, include_mt_buttons=False)
         except Exception as e:
-            logging.error(f"Command Listener Error: {e}")
+            logging.error(f"Telegram Listener Error: {e}")
         await asyncio.sleep(3)
 
 # ========================================================================================
-# 4. جلب البيانات غير المتزامن (ASYNC DATA FETCHING)
+# 4. جلب البيانات ومؤشرات التحليل الفني الصارمة
 # ========================================================================================
 async def fetch_candles_async(yf_symbol, timeframe="15m", period="5d"):
     def _fetch():
         try:
             ticker = yf.Ticker(yf_symbol)
             df = ticker.history(period=period, interval=timeframe)
-            if df.empty: return None
+            if df.empty or len(df) < 30: return None
             df.reset_index(inplace=True)
             df.rename(columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'}, inplace=True)
             return df
@@ -249,13 +287,10 @@ async def fetch_candles_async(yf_symbol, timeframe="15m", period="5d"):
             return None
     return await asyncio.to_thread(_fetch)
 
-# ========================================================================================
-# 5. المؤشرات التحليلية واستراتيجية SMC/ICT
-# ========================================================================================
 def calculate_rsi(series, period=14):
     delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(period).mean().replace(0, 1e-10)
+    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/period, adjust=False).mean().replace(0, 1e-10)
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
@@ -265,54 +300,101 @@ def calculate_adx(df, period=14):
     df['down'] = df['low'].shift(1) - df['low']
     df['+dm'] = np.where((df['up'] > df['down']) & (df['up'] > 0), df['up'], 0)
     df['-dm'] = np.where((df['down'] > df['up']) & (df['down'] > 0), df['down'], 0)
-    tr = np.maximum(df['high'] - df['low'], np.maximum(abs(df['high'] - df['close'].shift(1)), abs(df['low'] - df['close'].shift(1))))
-    atr = pd.Series(tr).rolling(period).mean().replace(0, 1e-10)
-    plus_di = 100 * (pd.Series(df['+dm']).rolling(period).mean() / atr)
-    minus_di = 100 * (pd.Series(df['-dm']).rolling(period).mean() / atr)
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, 1e-10)
-    return dx.rolling(period).mean().iloc[-1]
+    high_low = df['high'] - df['low']
+    high_close = np.abs(df['high'] - df['close'].shift())
+    low_close = np.abs(df['low'] - df['close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/period, adjust=False).mean().replace(0, 1e-10)
+    plus_di = 100 * (pd.Series(df['+dm']).ewm(alpha=1/period, adjust=False).mean() / atr)
+    minus_di = 100 * (pd.Series(df['-dm']).ewm(alpha=1/period, adjust=False).mean() / atr)
+    denom = (plus_di + minus_di).replace(0, 1e-10)
+    dx = (np.abs(plus_di - minus_di) / denom) * 100
+    adx = dx.ewm(alpha=1/period, adjust=False).mean().fillna(20.0)
+    return adx
 
-def find_swings(df, length=5):
+def find_swing_points(df, length=7):
     highs, lows = [], []
     for i in range(length, len(df) - length - 1):
         if all(df['high'].iloc[i] > df['high'].iloc[i-j] for j in range(1, length+1)) and \
            all(df['high'].iloc[i] > df['high'].iloc[i+j] for j in range(1, length+1)):
-            highs.append(df['high'].iloc[i])
+            highs.append({"index": i, "price": df['high'].iloc[i]})
         if all(df['low'].iloc[i] < df['low'].iloc[i-j] for j in range(1, length+1)) and \
            all(df['low'].iloc[i] < df['low'].iloc[i+j] for j in range(1, length+1)):
-            lows.append(df['low'].iloc[i])
+            lows.append({"index": i, "price": df['low'].iloc[i]})
     return highs, lows
 
 def detect_market_structure(df):
-    highs, lows = find_swings(df)
+    highs, lows = find_swing_points(df, length=7)
     if len(highs) < 2 or len(lows) < 2: return {"bos": "NONE", "choch": "NONE"}
-    closed_price = df['close'].iloc[-1]
+    last_high, previous_high = highs[-1]["price"], highs[-2]["price"]
+    last_low, previous_low = lows[-1]["price"], lows[-2]["price"]
+    closed_price = df['close'].iloc[-2]
+    
     bos, choch = "NONE", "NONE"
-    if closed_price > highs[-1]: bos = "BULLISH_BOS"
-    elif closed_price < lows[-1]: bos = "BEARISH_BOS"
-    if lows[-2] < lows[-1] and closed_price > highs[-2]: choch = "BULLISH_CHOCH"
-    elif highs[-2] > highs[-1] and closed_price < lows[-2]: choch = "BEARISH_CHOCH"
+    if closed_price > last_high: bos = "BULLISH_BOS"
+    elif closed_price < last_low: bos = "BEARISH_BOS"
+    
+    if previous_low < last_low and closed_price > previous_high: choch = "BULLISH_CHOCH"
+    elif previous_high > last_high and closed_price < previous_low: choch = "BEARISH_CHOCH"
     return {"bos": bos, "choch": choch}
 
-def calculate_trade_setup(symbol, entry, direction, df_15m):
-    tr = np.maximum(df_15m['high'] - df_15m['low'], abs(df_15m['close'] - df_15m['close'].shift(1)))
-    atr = tr.rolling(14).mean().iloc[-1]
-    if pd.isna(atr) or atr == 0: atr = entry * 0.002
+def detect_liquidity_sweep(df):
+    if len(df) < 30: return "NONE"
+    highs, lows = find_swing_points(df, length=7)
+    if not highs or not lows: return "NONE"
+    recent_high, recent_low = highs[-1]["price"], lows[-1]["price"]
+    candle = df.iloc[-2]
+    if candle['high'] > recent_high and candle['close'] < recent_high: return "BEARISH_SWEEP"
+    if candle['low'] < recent_low and candle['close'] > recent_low: return "BULLISH_SWEEP"
+    return "NONE"
 
-    if "BUY" in direction:
-        stop = entry - (atr * 1.5)
-        risk = entry - stop
-        tp1, tp2, tp3 = entry + (risk * 1.2), entry + (risk * 2.5), entry + (risk * 4.0)
+def calculate_dynamic_sl_tp(symbol, live_entry, direction, df_15m):
+    high_low = df_15m['high'] - df_15m['low']
+    high_close = np.abs(df_15m['high'] - df_15m['close'].shift())
+    low_close = np.abs(df_15m['low'] - df_15m['close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean().iloc[-2]
+    if pd.isna(atr) or atr == 0: atr = live_entry * 0.002
+
+    highs, lows = find_swing_points(df_15m, length=7)
+    atr_buffer = atr * 1.2
+
+    if "BUY" in direction or "LONG" in direction:
+        recent_low = lows[-1]["price"] if lows else (live_entry - atr * 2.0)
+        stop = min(recent_low - atr_buffer, live_entry - (atr * 1.5))
+        risk = live_entry - stop
+        tp1 = live_entry + (risk * 1.2)
+        tp2 = live_entry + (risk * 2.5)
+        tp3 = live_entry + (risk * 4.5)
     else:
-        stop = entry + (atr * 1.5)
-        risk = stop - entry
-        tp1, tp2, tp3 = entry - (risk * 1.2), entry - (risk * 2.5), entry - (risk * 4.0)
+        recent_high = highs[-1]["price"] if highs else (live_entry + atr * 2.0)
+        stop = max(recent_high + atr_buffer, live_entry + (atr * 1.5))
+        risk = stop - live_entry
+        tp1 = live_entry - (risk * 1.2)
+        tp2 = live_entry - (risk * 2.5)
+        tp3 = live_entry - (risk * 4.5)
 
-    rr = abs(tp2 - entry) / abs(entry - stop) if abs(entry - stop) > 0 else 2.5
-    return stop, tp1, tp2, tp3, round(rr, 2)
+    risk_val = abs(live_entry - stop)
+    reward_val = abs(tp2 - live_entry)
+    rr_ratio = reward_val / risk_val if risk_val > 0 else 2.5
+    return stop, tp1, tp2, tp3, round(rr_ratio, 2)
+
+def calculate_score(direction, structure_15m, sweep_15m, volume_ok):
+    score = 0
+    if "BUY" in direction or "LONG" in direction:
+        if structure_15m["bos"] == "BULLISH_BOS": score += 40
+        elif structure_15m["choch"] == "BULLISH_CHOCH": score += 35
+    else:
+        if structure_15m["bos"] == "BEARISH_BOS": score += 40
+        elif structure_15m["choch"] == "BEARISH_CHOCH": score += 35
+
+    if volume_ok: score += 30
+    if sweep_15m != "NONE": score += 20
+    score += 15  # إعطاء النقاط عند توافق الفريمين
+    return max(0, score)
 
 # ========================================================================================
-# 6. تحليل وتقييم الفرص
+# 5. محرك التحليل الشامل لجميع الأزواج والذهب
 # ========================================================================================
 async def analyze_symbol(yf_symbol):
     display_name = SYMBOL_MAP[yf_symbol]
@@ -325,33 +407,49 @@ async def analyze_symbol(yf_symbol):
         return None
 
     df_15m = await fetch_candles_async(yf_symbol, "15m", "5d")
-    df_1h = await fetch_candles_async(yf_symbol, "1h", "7d")
+    df_1h = await fetch_candles_async(yf_symbol, "1h", "10d")
 
-    if df_15m is None or df_1h is None or len(df_15m) < 30: return None
+    if df_15m is None or df_1h is None or len(df_15m) < 50 or len(df_1h) < 50: return None
 
     live_price = float(df_15m['close'].iloc[-1])
-    rsi_val = calculate_rsi(df_15m['close']).iloc[-1]
-    adx_val = calculate_adx(df_15m)
-    ema50_1h = df_1h['close'].ewm(span=50, adjust=False).mean().iloc[-1]
-    structure = detect_market_structure(df_15m)
+    
+    # 1. فلتر ADX الصارم (> 30.0)
+    adx_series = calculate_adx(df_15m, 14)
+    if adx_series.iloc[-1] < 30.0: return None
+
+    structure_15m = detect_market_structure(df_15m)
+    sweep_15m = detect_liquidity_sweep(df_15m)
+    
+    # 2. فلتر السيولة الحجمية (Volume)
+    vol_ma = df_15m['volume'].rolling(20).mean().iloc[-2]
+    volume_ok = df_15m['volume'].iloc[-2] > (vol_ma * 1.5) if vol_ma > 0 else True
 
     direction = None
-    score = 0
+    if structure_15m["bos"] == "BULLISH_BOS" or structure_15m["choch"] == "BULLISH_CHOCH":
+        direction = "BUY 🟢"
+    elif structure_15m["bos"] == "BEARISH_BOS" or structure_15m["choch"] == "BEARISH_CHOCH":
+        direction = "SELL 🔴"
 
-    if (live_price > ema50_1h) and (adx_val > 20) and (rsi_val < 65):
-        if structure["bos"] == "BULLISH_BOS": direction = "BUY 🟢"; score += 50
-        elif structure["choch"] == "BULLISH_CHOCH": direction = "BUY 🟢"; score += 40
-        else: direction = "BUY 🟢"; score += 30
+    if not direction: return None
 
-    elif (live_price < ema50_1h) and (adx_val > 20) and (rsi_val > 35):
-        if structure["bos"] == "BEARISH_BOS": direction = "SELL 🔴"; score += 50
-        elif structure["choch"] == "BEARISH_CHOCH": direction = "SELL 🔴"; score += 40
-        else: direction = "SELL 🔴"; score += 30
+    # 3. فلتر RSI الصارم
+    rsi_series = calculate_rsi(df_15m['close'], 14)
+    live_rsi = rsi_series.iloc[-1]
+    if "BUY" in direction and not (50.0 <= live_rsi <= 70.0): return None
+    if "SELL" in direction and not (30.0 <= live_rsi <= 50.0): return None
 
-    if not direction or score < 30: return None
+    # 4. فلتر المتوسطات EMA20 و EMA200 على فريم الساعة (التأكيد)
+    ema20_1h = df_1h['close'].ewm(span=20, adjust=False).mean().iloc[-1]
+    ema200_1h = df_1h['close'].ewm(span=200, adjust=False).mean().iloc[-1]
 
-    stop, tp1, tp2, tp3, rr = calculate_trade_setup(display_name, live_price, direction, df_15m)
-    if rr < MIN_RR_RATIO: return None
+    if "BUY" in direction and (df_1h['close'].iloc[-1] < ema20_1h or live_price < ema200_1h): return None
+    if "SELL" in direction and (df_1h['close'].iloc[-1] > ema20_1h or live_price > ema200_1h): return None
+
+    stop, tp1, tp2, tp3, rr = calculate_dynamic_sl_tp(display_name, live_price, direction, df_15m)
+    score = calculate_score(direction, structure_15m, sweep_15m, volume_ok)
+
+    # التطبيق الصارم للشرط القياسي (95 نقطة)
+    if score < SIGNAL_THRESHOLD or rr < MIN_RR_RATIO: return None
 
     return {
         "symbol": display_name, "direction": direction, "entry": live_price,
@@ -360,7 +458,7 @@ async def analyze_symbol(yf_symbol):
     }
 
 # ========================================================================================
-# 7. إدارة المتابعة التلقائية وتحديث الصفقات (WEBSOCKET SIMULATION)
+# 6. المتابعة التلقائية المباشرة للصفقات المفتوحة
 # ========================================================================================
 async def monitor_trades_loop():
     while True:
@@ -377,102 +475,135 @@ async def monitor_trades_loop():
                 current_price = float(df['close'].iloc[-1])
                 symbol_name = trade['symbol']
                 msg_id = trade.get("msg_id")
+                local_now = get_local_time()
+                duration = format_duration(trade['timestamp'])
+
+                trade["highest"] = max(trade.get("highest", current_price), current_price)
+                trade["lowest"] = min(trade.get("lowest", current_price), current_price)
 
                 if "BUY" in trade['direction']:
                     if current_price >= trade['tp3']:
-                        await update_trade(trade_id, "TP3_WIN", 4.0)
-                        msg = f"🔱 *#{symbol_name}*\n✅ *TP3 HIT! (+4.0R)* 🔥🚀\n📊 Price: `{format_price(symbol_name, trade['tp3'])}`\n⏰ `{get_local_time()}`"
+                        await update_trade(trade_id, "TP3_WIN", 4.5)
+                        msg = f"🔱 <b>#{symbol_name}</b>\n✅ <b>TP3 HIT! (+4.5R) 🔥🚀</b>\n📊 Price: <code>{format_price(symbol_name, trade['tp3'])}</code>\n⏱ {duration}\n⏰ {local_now}\n\n💡 إغلاق الصفقة بالكامل وتحقيق أهداف خيالية!"
                         await send_telegram(msg, reply_to_message_id=msg_id)
                         del active_live_trades[trade_id]
                     elif not trade.get('hit_tp2') and current_price >= trade['tp2']:
                         trade['hit_tp2'], trade['hit_tp1'] = True, True
                         trade['sl'] = trade['entry']
-                        await update_trade_progress(trade_id, hit_tp1=True, hit_tp2=True, new_sl=trade['sl'])
-                        msg = f"🔱 *#{symbol_name}*\n✅ *TP2 HIT! (+2.5R)* ⚡️\n📊 Price: `{format_price(symbol_name, trade['tp2'])}`\n🛡 Move SL to Entry!"
+                        await update_trade_progress(trade_id, hit_tp1=True, hit_tp2=True, new_sl=trade['sl'], highest=trade['highest'], lowest=trade['lowest'])
+                        msg = f"🔱 <b>#{symbol_name}</b>\n✅ <b>TP2 HIT! (+2.5R) ⚡️</b>\n📊 Price: <code>{format_price(symbol_name, trade['tp2'])}</code>\n⏱ {duration}\n⏰ {local_now}\n\n🛡 تم نقل الـ SL لنقطة الدخول لحماية الأرباح بالكامل!"
                         await send_telegram(msg, reply_to_message_id=msg_id)
                     elif not trade.get('hit_tp1') and current_price >= trade['tp1']:
                         trade['hit_tp1'] = True
-                        trade['sl'] = trade['entry'] - ((trade['entry'] - trade['stop']) * 0.5)
-                        await update_trade_progress(trade_id, hit_tp1=True, hit_tp2=False, new_sl=trade['sl'])
-                        msg = f"🔱 *#{symbol_name}*\n✅ *TP1 HIT! (+1.2R)* 🎯\n📊 Price: `{format_price(symbol_name, trade['tp1'])}`\n🛡 SL updated to secure partial profits."
+                        trade['sl'] = trade['entry'] + ((trade['tp1'] - trade['entry']) * 0.5)
+                        await update_trade_progress(trade_id, hit_tp1=True, hit_tp2=False, new_sl=trade['sl'], highest=trade['highest'], lowest=trade['lowest'])
+                        msg = f"🔱 <b>#{symbol_name}</b>\n✅ <b>TP1 HIT! (+1.2R) 🎯</b>\n📊 Price: <code>{format_price(symbol_name, trade['tp1'])}</code>\n⏱ {duration}\n⏰ {local_now}\n\n🛡 تم تفعيل التأمين الذكي وحجز الأرباح!"
                         await send_telegram(msg, reply_to_message_id=msg_id)
                     elif current_price <= trade['sl']:
-                        result = "STOP_LOSS" if not trade.get('hit_tp1') else "TRAIL_PROFIT"
-                        pnl = -1.0 if not trade.get('hit_tp1') else 0.5
+                        result = "TRAIL_PROFIT" if trade.get('hit_tp1') else "STOP_LOSS"
+                        pnl = 0.5 if trade.get('hit_tp1') else -1.0
                         await update_trade(trade_id, result, pnl)
-                        msg = f"🛑 *SL Hit:* `{symbol_name}` @ `{format_price(symbol_name, trade['sl'])}`"
+                        msg = f"🛑 <b>SL Hit:</b> <code>{symbol_name}</code> @ <code>{format_price(symbol_name, trade['sl'])}</code>\n⏱ {duration}\n⏰ {local_now}"
                         await send_telegram(msg, reply_to_message_id=msg_id)
                         del active_live_trades[trade_id]
 
                 elif "SELL" in trade['direction']:
                     if current_price <= trade['tp3']:
-                        await update_trade(trade_id, "TP3_WIN", 4.0)
-                        msg = f"🔱 *#{symbol_name}*\n✅ *TP3 HIT! (+4.0R)* 🔥🚀\n📊 Price: `{format_price(symbol_name, trade['tp3'])}`\n⏰ `{get_local_time()}`"
+                        await update_trade(trade_id, "TP3_WIN", 4.5)
+                        msg = f"🔱 <b>#{symbol_name}</b>\n✅ <b>TP3 HIT! (+4.5R) 🔥🚀</b>\n📊 Price: <code>{format_price(symbol_name, trade['tp3'])}</code>\n⏱ {duration}\n⏰ {local_now}\n\n💡 إغلاق الصفقة بالكامل وتحقيق أهداف خيالية!"
                         await send_telegram(msg, reply_to_message_id=msg_id)
                         del active_live_trades[trade_id]
                     elif not trade.get('hit_tp2') and current_price <= trade['tp2']:
                         trade['hit_tp2'], trade['hit_tp1'] = True, True
                         trade['sl'] = trade['entry']
-                        await update_trade_progress(trade_id, hit_tp1=True, hit_tp2=True, new_sl=trade['sl'])
-                        msg = f"🔱 *#{symbol_name}*\n✅ *TP2 HIT! (+2.5R)* ⚡️\n📊 Price: `{format_price(symbol_name, trade['tp2'])}`\n🛡 Move SL to Entry!"
+                        await update_trade_progress(trade_id, hit_tp1=True, hit_tp2=True, new_sl=trade['sl'], highest=trade['highest'], lowest=trade['lowest'])
+                        msg = f"🔱 <b>#{symbol_name}</b>\n✅ <b>TP2 HIT! (+2.5R) ⚡️</b>\n📊 Price: <code>{format_price(symbol_name, trade['tp2'])}</code>\n⏱ {duration}\n⏰ {local_now}\n\n🛡 تم نقل الـ SL لنقطة الدخول لحماية الأرباح بالكامل!"
                         await send_telegram(msg, reply_to_message_id=msg_id)
                     elif not trade.get('hit_tp1') and current_price <= trade['tp1']:
                         trade['hit_tp1'] = True
-                        trade['sl'] = trade['entry'] + ((trade['stop'] - trade['entry']) * 0.5)
-                        await update_trade_progress(trade_id, hit_tp1=True, hit_tp2=False, new_sl=trade['sl'])
-                        msg = f"🔱 *#{symbol_name}*\n✅ *TP1 HIT! (+1.2R)* 🎯\n📊 Price: `{format_price(symbol_name, trade['tp1'])}`\n🛡 SL updated to secure partial profits."
+                        trade['sl'] = trade['entry'] - ((trade['entry'] - trade['tp1']) * 0.5)
+                        await update_trade_progress(trade_id, hit_tp1=True, hit_tp2=False, new_sl=trade['sl'], highest=trade['highest'], lowest=trade['lowest'])
+                        msg = f"🔱 <b>#{symbol_name}</b>\n✅ <b>TP1 HIT! (+1.2R) 🎯</b>\n📊 Price: <code>{format_price(symbol_name, trade['tp1'])}</code>\n⏱ {duration}\n⏰ {local_now}\n\n🛡 تم تفعيل التأمين الذكي وحجز الأرباح!"
                         await send_telegram(msg, reply_to_message_id=msg_id)
                     elif current_price >= trade['sl']:
-                        result = "STOP_LOSS" if not trade.get('hit_tp1') else "TRAIL_PROFIT"
-                        pnl = -1.0 if not trade.get('hit_tp1') else 0.5
+                        result = "TRAIL_PROFIT" if trade.get('hit_tp1') else "STOP_LOSS"
+                        pnl = 0.5 if trade.get('hit_tp1') else -1.0
                         await update_trade(trade_id, result, pnl)
-                        msg = f"🛑 *SL Hit:* `{symbol_name}` @ `{format_price(symbol_name, trade['sl'])}`"
+                        msg = f"🛑 <b>SL Hit:</b> <code>{symbol_name}</code> @ <code>{format_price(symbol_name, trade['sl'])}</code>\n⏱ {duration}\n⏰ {local_now}"
                         await send_telegram(msg, reply_to_message_id=msg_id)
                         del active_live_trades[trade_id]
 
         except Exception as e:
-            logging.error(f"Trade Monitor Error: {e}")
+            logging.error(f"Trade Monitor Exception: {e}")
         await asyncio.sleep(CHECK_INTERVAL)
 
 # ========================================================================================
-# 8. الحلقة الرئيسية للمحرك (MAIN ASYNC LOOP)
+# 7. الحلقة التشغيلية الرئيسية
 # ========================================================================================
 async def main():
     await init_database()
     await reload_active_trades()
     
-    await send_telegram("🚀 *V50.0 Master Forex & Gold Engine Active!*\n• Real-Time SMC Logic\n• Dynamic Database Tracking Enabled", include_mt_buttons=False)
+    await send_telegram(
+        f"🚀 <b>V50.5 Forex & Gold Engine Active!</b>\n"
+        f"• Strict Threshold: <b>{SIGNAL_THRESHOLD}</b> | Min R:R: <b>{MIN_RR_RATIO}</b>\n"
+        f"• SMC/ICT Liquidity & Multi-Timeframe Filters Active\n"
+        f"• Direct MetaTrader Buttons Included 📲", 
+        include_mt_buttons=False
+    )
 
     asyncio.create_task(monitor_trades_loop())
     asyncio.create_task(telegram_command_listener())
 
+    symbols = list(SYMBOL_MAP.keys())
+
     while True:
         try:
             if len(active_live_trades) < MAX_ACTIVE_TRADES:
-                for yf_symbol in SYMBOL_MAP.keys():
-                    trade = await analyze_symbol(yf_symbol)
-                    if trade and len(active_live_trades) < MAX_ACTIVE_TRADES:
-                        row_id = await save_trade(trade)
-                        if row_id:
-                            display_name = trade['symbol']
-                            signaled_history[display_name] = time.time()
+                for i in range(0, len(symbols), BATCH_SIZE):
+                    if len(active_live_trades) >= MAX_ACTIVE_TRADES: break
+                    batch = symbols[i:i + BATCH_SIZE]
+                    
+                    clean_batch = [SYMBOL_MAP[s] for s in batch]
+                    logging.info(f"🔍 جاري فحص دفعة أسواق الفوركس والذهب: {clean_batch}")
 
-                            msg = (
-                                f"🚨 *SIGNAL:* `{trade['symbol']}` ({trade['direction']})\n\n"
-                                f"📍 *Entry:* `{format_price(display_name, trade['entry'])}`\n"
-                                f"🎯 *TP1:* `{format_price(display_name, trade['tp1'])}`\n"
-                                f"🎯 *TP2:* `{format_price(display_name, trade['tp2'])}`\n"
-                                f"🎯 *TP3:* `{format_price(display_name, trade['tp3'])}`\n"
-                                f"🛑 *SL:* `{format_price(display_name, trade['stop'])}`\n\n"
-                                f"⚖️ *R:R:* `{trade['rr']}` | ⏰ `{get_local_time()}`"
-                            )
+                    tasks = [analyze_symbol(sym) for sym in batch]
+                    results = await asyncio.gather(*tasks)
 
-                            msg_id = await send_telegram(msg, include_mt_buttons=True)
-                            if msg_id:
-                                await update_trade_msg_id(row_id, msg_id)
-                                trade["msg_id"] = msg_id
-                                trade["sl"] = trade["stop"]
-                                active_live_trades[row_id] = trade
+                    for trade in results:
+                        if trade and len(active_live_trades) < MAX_ACTIVE_TRADES:
+                            row_id = await save_trade(trade)
+                            if row_id:
+                                display_name = trade['symbol']
+                                signaled_history[display_name] = time.time()
+                                local_now = get_local_time()
+
+                                msg = (
+                                    f"<b>#{display_name.replace('/', '')}</b> ({trade['direction']})\n"
+                                    f"Exchanges: Forex & Gold Masters\n\n"
+                                    f"Entry Targets:\n"
+                                    f"1) <code>{format_price(display_name, trade['entry'])}</code>\n\n"
+                                    f"Take-Profit Targets:\n"
+                                    f"1) <code>{format_price(display_name, trade['tp1'])}</code>\n"
+                                    f"2) <code>{format_price(display_name, trade['tp2'])}</code>\n"
+                                    f"3) <code>{format_price(display_name, trade['tp3'])}</code>\n\n"
+                                    f"Stop Target:\n"
+                                    f"1) <code>{format_price(display_name, trade['stop'])}</code>\n\n"
+                                    f"━━━━━━━━━━━━━━━\n"
+                                    f"📊 Score: <b>{trade['score']}/105</b> | R:R: <b>{trade['rr']}:1</b>\n"
+                                    f"⏰ Time: <code>{local_now}</code>"
+                                )
+
+                                msg_id = await send_telegram(msg, include_mt_buttons=True)
+                                if msg_id:
+                                    await update_trade_msg_id(row_id, msg_id)
+                                    trade["msg_id"] = msg_id
+                                    trade["sl"] = trade["stop"]
+                                    trade["highest"] = trade["entry"]
+                                    trade["lowest"] = trade["entry"]
+                                    active_live_trades[row_id] = trade
+
+                    await asyncio.sleep(BATCH_DELAY)
 
             await asyncio.sleep(CHECK_INTERVAL)
         except Exception as e:
@@ -481,4 +612,12 @@ async def main():
 
 if __name__ == "__main__":
     keep_alive()
-    asyncio.run(main())
+    while True:
+        try:
+            print("\n🚀 Starting V50.5 Forex & Gold Ultra Precision Engine...")
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            logging.critical(f"Fatal Crash: {e}. Restarting in 10s...")
+            time.sleep(10)
