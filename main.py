@@ -1,6 +1,6 @@
 """
 ========================================================================================
-V40.5 Cloud Forex & Gold Engine - YFinance & Railway Ready ($10 to $10,000 Lot Matrix)
+V50.0 Ultimate Cloud Forex & Gold Engine - Smart Tracking, News Guard & Session Filter
 ========================================================================================
 """
 
@@ -20,44 +20,40 @@ from flask import Flask
 # --- إعدادات التسجيل ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- بيانات التليجرام الخاصة بك ---
+# --- بيانات التليجرام المعتمدة ---
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '8664695982:AAHMaTwCbX1aV1sZjKlie1jK5zJB4tXFSVo')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '8664695982')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '6435071066')
 
-# الأزواج المستهدفة في YFinance
+# الأزواج المستهدفة
 SYMBOL_MAP = {
-    "GC=F": "XAUUSD",     # عقود الذهب الآجلة
-    "EURUSD=X": "EURUSD", # يورو / دولار
-    "GBPUSD=X": "GBPUSD", # استرليني / دولار
-    "JPY=X": "USDJPY"     # دولار / ين
+    "GC=F": "XAUUSD",
+    "EURUSD=X": "EURUSD",
+    "GBPUSD=X": "GBPUSD",
+    "JPY=X": "USDJPY"
 }
 
-DATABASE = 'forex_signals_cloud.db'
-CHECK_INTERVAL = 30
-
+DATABASE = 'forex_signals_v50.db'
+CHECK_INTERVAL = 20
 MIN_RR_RATIO = 2.5
 COOLDOWN_HOURS = 4.0
-RISK_PER_TRADE = 0.01  # مخاطرة 1%
+RISK_PER_TRADE = 0.01
 
 LOCAL_TZ = timezone(timedelta(hours=3))
 signaled_history = {}
+active_trades = {}  # لمتابعة التوصيات المفتوحة
 http_session = None
 
 # ======================================================================================== #
-# 1. FLASK KEEP-ALIVE SERVER (مهم جداً لمنع توقف Railway)
+# 1. FLASK KEEP-ALIVE
 # ======================================================================================== #
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "Forex & Gold Cloud Engine is ALIVE on Railway!", 200
-
-def run_server():
-    port = int(os.getenv('PORT', 8000))
-    app.run(host='0.0.0.0', port=port)
+    return "Forex & Gold V50 Engine is RUNNING!", 200
 
 def keep_alive():
-    t = Thread(target=run_server)
+    t = Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.getenv('PORT', 8000))))
     t.daemon = True
     t.start()
 
@@ -76,22 +72,14 @@ def get_local_time():
     return datetime.now(LOCAL_TZ).strftime("%I:%M %p")
 
 def format_price(symbol, price):
-    if "JPY" in symbol:
-        return f"{price:.3f}"
-    elif "XAU" in symbol or "GC=F" in symbol:
-        return f"{price:.2f}"
-    else:
-        return f"{price:.5f}"
+    if "JPY" in symbol: return f"{price:.3f}"
+    elif "XAU" in symbol or "GC=F" in symbol: return f"{price:.2f}"
+    else: return f"{price:.5f}"
 
 async def send_telegram(message):
     global http_session
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
     try:
         if http_session is None or http_session.closed:
             http_session = aiohttp.ClientSession()
@@ -101,19 +89,30 @@ async def send_telegram(message):
         logging.error(f"Telegram Error: {e}")
 
 # ======================================================================================== #
-# 3. جلب بيانات YFinance والمؤشرات الفنية
+# 3. فحص جلسات التداول وتصفية التقلبات الشديدة (News Guard)
+# ======================================================================================== #
+def is_valid_session():
+    now_utc = datetime.now(timezone.utc).hour
+    return 7 <= now_utc <= 21
+
+def check_volatility_spike(df):
+    tr = np.maximum(df['high'] - df['low'], abs(df['high'] - df['close'].shift(1)))
+    atr = tr.rolling(14).mean().iloc[-1]
+    last_candle_body = abs(df['close'].iloc[-1] - df['open'].iloc[-1])
+    return last_candle_body > (atr * 2.8)
+
+# ======================================================================================== #
+# 4. جلب البيانات وتحليل المؤشرات
 # ======================================================================================== #
 def fetch_candles(yf_symbol, timeframe="15m", period="5d"):
     try:
         ticker = yf.Ticker(yf_symbol)
         df = ticker.history(period=period, interval=timeframe)
-        if df.empty:
-            return None
+        if df.empty: return None
         df.reset_index(inplace=True)
         df.rename(columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'}, inplace=True)
         return df
-    except Exception as e:
-        logging.error(f"Error fetching data for {yf_symbol}: {e}")
+    except Exception:
         return None
 
 def calculate_rsi(df, period=14):
@@ -148,34 +147,24 @@ def find_swings(df, length=5):
             lows.append(df['low'].iloc[i])
     return highs, lows
 
-# ======================================================================================== #
-# 4. حساب جدول أحجام العقود (Lot Matrix) من 10$ إلى 10,000$
-# ======================================================================================== #
 def calculate_lot_matrix(entry, stop, symbol):
     pips_at_risk = abs(entry - stop)
-    if pips_at_risk == 0:
-        return "• 0.01 Lot"
-
+    if pips_at_risk == 0: return "• 0.01 Lot"
     accounts = [10, 50, 100, 500, 1000, 5000, 10000]
     matrix_lines = []
-
     for acc in accounts:
         risk_amount = acc * RISK_PER_TRADE
         if "XAU" in symbol or "GC=F" in symbol:
             lot = max(0.01, round(risk_amount / (pips_at_risk * 100), 2))
         else:
-            pip_value = 10.0
-            lot = max(0.01, round(risk_amount / (pips_at_risk * 10000 * pip_value), 2))
-
+            lot = max(0.01, round(risk_amount / (pips_at_risk * 10000 * 10.0), 2))
         matrix_lines.append(f"• <b>${acc:,}:</b> {lot} Lot")
-
     return "\n".join(matrix_lines)
 
 def calculate_trade_setup(symbol, entry, direction, df_15m):
     high_low = df_15m['high'] - df_15m['low']
     atr = high_low.rolling(14).mean().iloc[-2]
-    if pd.isna(atr) or atr == 0:
-        atr = entry * 0.002
+    if pd.isna(atr) or atr == 0: atr = entry * 0.002
 
     if direction == "LONG":
         stop = entry - (atr * 1.5)
@@ -188,18 +177,20 @@ def calculate_trade_setup(symbol, entry, direction, df_15m):
 
     rr = abs(tp2 - entry) / abs(entry - stop) if abs(entry - stop) > 0 else 2.5
     lot_matrix = calculate_lot_matrix(entry, stop, symbol)
-
     return stop, tp1, tp2, tp3, round(rr, 2), lot_matrix
 
 # ======================================================================================== #
-# 5. تحليل الإشارة بالكامل
+# 5. تحليل الفرص ومتابعة الصفقات المفتوحة
 # ======================================================================================== #
 async def analyze_symbol(yf_symbol):
-    display_name = SYMBOL_MAP[yf_symbol]
+    if not is_valid_session(): return None
     
+    display_name = SYMBOL_MAP[yf_symbol]
     df_15m = await asyncio.to_thread(fetch_candles, yf_symbol, "15m", "5d")
     df_1h = await asyncio.to_thread(fetch_candles, yf_symbol, "1h", "7d")
+    
     if df_15m is None or df_1h is None or len(df_15m) < 30: return None
+    if check_volatility_spike(df_15m): return None
 
     live_price = float(df_15m['close'].iloc[-1])
     highs, lows = find_swings(df_15m)
@@ -223,19 +214,72 @@ async def analyze_symbol(yf_symbol):
     return {
         "symbol": display_name, "direction": direction, "entry": live_price,
         "stop": stop, "tp1": tp1, "tp2": tp2, "tp3": tp3,
-        "rr": rr, "lot_matrix": lot_matrix,
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "rr": rr, "lot_matrix": lot_matrix
     }
+
+async def track_active_trades():
+    """ تعقب التوصيات وإرسال تنبيهات التحديث أوتوماتيكياً """
+    for symbol_name, trade in list(active_trades.items()):
+        yf_symbol = [k for k, v in SYMBOL_MAP.items() if v == symbol_name][0]
+        df = await asyncio.to_thread(fetch_candles, yf_symbol, "1m", "1d")
+        if df is None or df.empty: continue
+
+        current_price = df['close'].iloc[-1]
+        
+        # حالة صفقات الشراء LONG
+        if trade['direction'] == "LONG":
+            if not trade.get('tp1_hit') and current_price >= trade['tp1']:
+                trade['tp1_hit'] = True
+                await send_telegram(
+                    f"🎯 <b>{symbol_name} - TP1 Hit!</b>\n"
+                    f"✅ تم تحقيق الهدف الأول عند {format_price(symbol_name, trade['tp1'])}\n"
+                    f"🛡 <b>إجراء مطلوب:</b> انقل الوقف إلى سعر الدخول ({format_price(symbol_name, trade['entry'])}) لتأمين الصفقة (Break-Even)."
+                )
+            elif not trade.get('tp2_hit') and current_price >= trade['tp2']:
+                trade['tp2_hit'] = True
+                await send_telegram(f"🎉 <b>{symbol_name} - TP2 Hit!</b>\n✅ تم تحقيق الهدف الثاني عند {format_price(symbol_name, trade['tp2'])}")
+            elif current_price <= trade['stop']:
+                await send_telegram(f"🛑 <b>{symbol_name} - Stop Loss Hit</b>\nتم إغلاق الصفقة عند {format_price(symbol_name, trade['stop'])}")
+                del active_trades[symbol_name]
+
+        # حالة صفقات البيع SHORT
+        elif trade['direction'] == "SHORT":
+            if not trade.get('tp1_hit') and current_price <= trade['tp1']:
+                trade['tp1_hit'] = True
+                await send_telegram(
+                    f"🎯 <b>{symbol_name} - TP1 Hit!</b>\n"
+                    f"✅ تم تحقيق الهدف الأول عند {format_price(symbol_name, trade['tp1'])}\n"
+                    f"🛡 <b>إجراء مطلوب:</b> انقل الوقف إلى سعر الدخول ({format_price(symbol_name, trade['entry'])}) لتأمين الصفقة (Break-Even)."
+                )
+            elif not trade.get('tp2_hit') and current_price <= trade['tp2']:
+                trade['tp2_hit'] = True
+                await send_telegram(f"🎉 <b>{symbol_name} - TP2 Hit!</b>\n✅ تم تحقيق الهدف الثاني عند {format_price(symbol_name, trade['tp2'])}")
+            elif current_price >= trade['stop']:
+                await send_telegram(f"🛑 <b>{symbol_name} - Stop Loss Hit</b>\nتم إغلاق الصفقة عند {format_price(symbol_name, trade['stop'])}")
+                del active_trades[symbol_name]
 
 # ======================================================================================== #
 # 6. المحرك الرئيسي
 # ======================================================================================== #
 async def main():
     await init_database()
-    await send_telegram("🚀 <b>تم تشغيل بوت الذهب والفوركس السحابي بنجاح!</b>\n• يعمل على Railway دون الحاجة لمنصة MT5")
+    
+    # رسالة الترحيب والتشغيل المحدثة
+    welcome_msg = (
+        "<b>Welcome to Forex & Gold Engine V50.0!</b>\n\n"
+        "<b>Status:</b> Engine Active & Running on Railway\n"
+        "<b>Features Enabled:</b>\n"
+        "• Smart Trade Tracking (Live TP/SL Alerts)\n"
+        "• Dynamic Lot Size Matrix ($10 to $10,000)\n"
+        "• Session & News Guard Active\n\n"
+        "Ready to send high-probability trading setups."
+    )
+    await send_telegram(welcome_msg)
 
     while True:
         try:
+            await track_active_trades()
+            
             for yf_symbol in SYMBOL_MAP.keys():
                 now_ts = time.time()
                 display_name = SYMBOL_MAP[yf_symbol]
@@ -246,6 +290,7 @@ async def main():
                 trade = await analyze_symbol(yf_symbol)
                 if trade:
                     signaled_history[display_name] = now_ts
+                    active_trades[display_name] = trade
                     sym_title = "🏆 GOLD (XAUUSD)" if "XAU" in trade['symbol'] else f"💱 {trade['symbol']}"
                     
                     msg = (
