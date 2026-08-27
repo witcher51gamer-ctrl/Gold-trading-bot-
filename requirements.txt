@@ -1,0 +1,6 @@
+aiohttp
+aiosqlite
+numpy
+pandas
+yfinance
+flask
