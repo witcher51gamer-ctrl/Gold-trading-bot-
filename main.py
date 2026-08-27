@@ -1,6 +1,6 @@
 """
 ========================================================================================
-V51.0 Master Forex & Gold Cloud Engine - Ultra Precision & News Aware
+V52.0 Master Forex & Gold Cloud Engine - Ultra Precision & Twelve Data (Fast & Live)
 ========================================================================================
 """
 
@@ -15,7 +15,6 @@ import aiohttp
 import aiosqlite
 import numpy as np
 import pandas as pd
-import yfinance as yf
 from flask import Flask
 
 # --- إعدادات التسجيل (Logging) ---
@@ -24,10 +23,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # --- الثوابت والإعدادات العامة ---
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '8664695982:AAHMaTwCbX1aV1sZjKlie1jK5zJB4tXFSVo')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '6021016826')
+TWELVE_DATA_API_KEY = os.getenv('TWELVE_DATA_API_KEY', 'YOUR_TWELVE_DATA_API_KEY') # ضع مفتاحك هنا أو في متغيرات البيئة
 
-TIMEFRAME_PRIMARY = "15m"   # فريم الدخول الأساسي
+TIMEFRAME_PRIMARY = "15min"   # فريم الدخول الأساسي (موافق لصيغة Twelve Data)
 TIMEFRAME_CONFIRM = "1h"    # فريم التأكيد الاتجاهي
-DATABASE = 'forex_master_signals_v51.db'
+DATABASE = 'forex_master_signals_v52.db'
 
 CHECK_INTERVAL = 15
 BATCH_SIZE = 4
@@ -38,20 +38,21 @@ MIN_RR_RATIO = 2.5           # حد أدنى للعائد مقابل المخا�
 MAX_ACTIVE_TRADES = 8        # أقصى عدد صفقات نشطة
 COOLDOWN_HOURS = 6.0         # فترة الانتظار لتكرار نفس الزوج
 
+# رموز Twelve Data المباشرة
 SYMBOL_MAP = {
-    "GC=F": "XAU/USD",       # الذهب
-    "SI=F": "XAG/USD",       # الفضة
-    "CL=F": "USOIL",         # النفط
-    "EURUSD=X": "EUR/USD",
-    "GBPUSD=X": "GBP/USD",
-    "USDJPY=X": "USD/JPY",
-    "AUDUSD=X": "AUD/USD",
-    "USDCAD=X": "USD/CAD",
-    "USDCHF=X": "USD/CHF",
-    "NZDUSD=X": "NZD/USD",
-    "EURGBP=X": "EUR/GBP",
-    "EURJPY=X": "EUR/JPY",
-    "GBPJPY=X": "GBP/JPY"
+    "XAU/USD": "XAU/USD",       # الذهب
+    "XAG/USD": "XAG/USD",       # الفضة
+    "WTI/USD": "USOIL",         # النفط (أو حسب الرمز المعتمد لديهم)
+    "EUR/USD": "EUR/USD",
+    "GBP/USD": "GBP/USD",
+    "USD/JPY": "USD/JPY",
+    "AUD/USD": "AUD/USD",
+    "USD/CAD": "USD/CAD",
+    "USD/CHF": "USD/CHF",
+    "NZD/USD": "NZD/USD",
+    "EUR/GBP": "EUR/GBP",
+    "EUR/JPY": "EUR/JPY",
+    "GBP/JPY": "GBP/JPY"
 }
 
 LOCAL_TZ = timezone(timedelta(hours=3))
@@ -68,7 +69,7 @@ app = Flask('')
 
 @app.route('/', methods=['GET', 'HEAD', 'POST'])
 def home():
-    return "V51.0 Forex & Gold Ultra Precision Cloud Engine is ALIVE!", 200
+    return "V52.0 Forex & Gold Ultra Precision Cloud Engine (Twelve Data) is ALIVE!", 200
 
 def run_server():
     port = int(os.getenv('PORT', 8000))
@@ -80,12 +81,11 @@ def keep_alive():
     t.start()
 
 # ========================================================================================
-# 2. فلتر الأخبار الاقتصادية المتقدم (ECONOMIC NEWS FILTER)
+# 2. فلتر الأخبار الاقتصادية المتقدم
 # ========================================================================================
 async def check_economic_news():
-    """يفحص تقويم الأخبار الاقتصادية لمنع التداول قبل وبعد الأخبار القوية بـ 30 دقيقة"""
     global news_blackout, http_session
-    url = "https://nws.mql5.com/news/v2/en/news.json" # مصدر إخباري سريع مجاني
+    url = "https://forexfactory-api.com/api/today"
     try:
         if http_session is None or http_session.closed:
             http_session = aiohttp.ClientSession()
@@ -93,18 +93,19 @@ async def check_economic_news():
             if response.status == 200:
                 data = await response.json()
                 now = datetime.now(timezone.utc)
-                for item in data[:10]:
-                    importance = item.get("importance", 0)
-                    news_time_str = item.get("time")
-                    if importance >= 3 and news_time_str:
-                        news_time = datetime.fromisoformat(news_time_str.replace("Z", "+00:00"))
-                        time_diff = abs((news_time - now).total_seconds()) / 60
-                        if time_diff <= 30: # حظر التداول ضمن نطاق 30 دقيقة
-                            news_blackout = True
-                            logging.warning(f"⚠️ حظر التداول مفعل بسبب خبر اقتصادي هام: {item.get('title')}")
-                            return True
+                for item in data:
+                    impact = str(item.get("impact", "")).lower()
+                    if "high" in impact or impact == "3":
+                        news_time_str = item.get("date")
+                        if news_time_str:
+                            news_time = datetime.fromisoformat(news_time_str.replace("Z", "+00:00"))
+                            time_diff = abs((news_time - now).total_seconds()) / 60
+                            if time_diff <= 30:
+                                news_blackout = True
+                                logging.warning(f"⚠️ حظر التداول مفعل بسبب خبر اقتصادي هام: {item.get('title')}")
+                                return True
     except Exception as e:
-        logging.error(f"خطأ أثناء فحص تقويم الأخبار: {e}")
+        logging.debug(f"فحص الأخبار ينتهي بدون حظر: {e}")
     news_blackout = False
     return False
 
@@ -188,7 +189,7 @@ def get_local_time():
 def format_price(symbol, price):
     if not price or price == 0: return "0.00"
     if "JPY" in symbol: return f"{price:.3f}"
-    elif "XAU" in symbol or "GC=F" in symbol or "OIL" in symbol: return f"{price:.2f}"
+    elif "XAU" in symbol or "XAG" in symbol or "OIL" in symbol: return f"{price:.2f}"
     else: return f"{price:.5f}"
 
 def format_duration(start_time_iso):
@@ -259,7 +260,7 @@ async def telegram_command_listener():
                         command = text.split('@')[0].lower() if text.startswith('/') else text.lower()
                         if command in ["/start", "/help"]:
                             reply = (
-                                f"🔱 <b>V51.0 Forex & Gold Ultra Engine</b> (Strict Threshold: {SIGNAL_THRESHOLD})\n\n"
+                                f"🔱 <b>V52.0 Forex & Gold Twelve Data Engine</b> (Strict Threshold: {SIGNAL_THRESHOLD})\n\n"
                                 f"• /status - ملخص الأداء القياسي والأرباح\n"
                                 f"• /active - الصفقات النشطة والمفتوحة حالياً\n"
                                 f"• /news - حالة حظر الأخبار الاقتصادية\n"
@@ -303,20 +304,37 @@ async def telegram_command_listener():
         await asyncio.sleep(3)
 
 # ========================================================================================
-# 5. جلب البيانات ومؤشرات التحليل الفني الصارمة
+# 5. جلب البيانات عبر TWELVE DATA API
 # ========================================================================================
-async def fetch_candles_async(yf_symbol, timeframe="15m", period="5d"):
-    def _fetch():
-        try:
-            ticker = yf.Ticker(yf_symbol)
-            df = ticker.history(period=period, interval=timeframe)
-            if df.empty or len(df) < 30: return None
-            df.reset_index(inplace=True)
-            df.rename(columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'}, inplace=True)
-            return df
-        except Exception:
-            return None
-    return await asyncio.to_thread(_fetch)
+async def fetch_candles_async(symbol, timeframe="15min", outputsize=100):
+    global http_session
+    url = f"https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": symbol,
+        "interval": timeframe,
+        "outputsize": outputsize,
+        "apikey": TWELVE_DATA_API_KEY,
+        "format": "JSON"
+    }
+    try:
+        if http_session is None or http_session.closed:
+            http_session = aiohttp.ClientSession()
+        async with http_session.get(url, params=params, timeout=10) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if "values" in data:
+                    df = pd.DataFrame(data["values"])
+                    # إعادة ترتيب الأعمدة وتصحيح الأنواع
+                    df = df.iloc[::-1].reset_index(drop=True) # ترتيب تصاعدي حسب الوقت
+                    for col in ['open', 'high', 'low', 'close', 'volume']:
+                        if col in df.columns:
+                            df[col] = pd.to_numeric(df[col], errors='coerce')
+                    df.rename(columns={'open': 'open', 'high': 'high', 'low': 'low', 'close': 'close', 'volume': 'volume'}, inplace=True)
+                    if len(df) < 30: return None
+                    return df
+    except Exception as e:
+        logging.error(f"Twelve Data Fetch Error for {symbol}: {e}")
+    return None
 
 def calculate_rsi(series, period=14):
     delta = series.diff()
@@ -389,7 +407,6 @@ def calculate_dynamic_sl_tp(symbol, live_entry, direction, df_15m):
 
     highs, lows = find_swing_points(df_15m, length=7)
     
-    # ⚡️ تخصيص نطاق أوسع للذهب والمعادن لتفادي الذيول السريعة (Spikes)
     is_gold_or_oil = "XAU" in symbol or "XAG" in symbol or "OIL" in symbol
     multiplier = 2.2 if is_gold_or_oil else 1.2
     spread_buffer = atr * 0.3 if is_gold_or_oil else 0.0
@@ -430,12 +447,12 @@ def calculate_score(direction, structure_15m, sweep_15m, volume_ok):
     return max(0, score)
 
 # ========================================================================================
-# 6. محرك التحليل الشامل لجميع الأزواج والذهب
+# 6. محرك التحليل الشامل
 # ========================================================================================
-async def analyze_symbol(yf_symbol):
-    if news_blackout: return None # إيقاف الفحص أثناء الأخبار
+async def analyze_symbol(api_symbol):
+    if news_blackout: return None
 
-    display_name = SYMBOL_MAP[yf_symbol]
+    display_name = SYMBOL_MAP[api_symbol]
     now_ts = time.time()
     
     for _, t in list(active_live_trades.items()):
@@ -444,23 +461,24 @@ async def analyze_symbol(yf_symbol):
     if display_name in signaled_history and (now_ts - signaled_history[display_name]) < (COOLDOWN_HOURS * 3600):
         return None
 
-    df_15m = await fetch_candles_async(yf_symbol, "15m", "5d")
-    df_1h = await fetch_candles_async(yf_symbol, "1h", "10d")
+    df_15m = await fetch_candles_async(api_symbol, "15min", 100)
+    df_1h = await fetch_candles_async(api_symbol, "1h", 100)
 
     if df_15m is None or df_1h is None or len(df_15m) < 50 or len(df_1h) < 50: return None
 
     live_price = float(df_15m['close'].iloc[-1])
     
-    # 1. فلتر ADX الصارم (> 30.0)
     adx_series = calculate_adx(df_15m, 14)
     if adx_series.iloc[-1] < 30.0: return None
 
     structure_15m = detect_market_structure(df_15m)
     sweep_15m = detect_liquidity_sweep(df_15m)
     
-    # 2. فلتر السيولة الحجمية (Volume)
-    vol_ma = df_15m['volume'].rolling(20).mean().iloc[-2]
-    volume_ok = df_15m['volume'].iloc[-2] > (vol_ma * 1.5) if vol_ma > 0 else True
+    vol_col = 'volume' if 'volume' in df_15m.columns else None
+    volume_ok = True
+    if vol_col and df_15m[vol_col].sum() > 0:
+        vol_ma = df_15m[vol_col].rolling(20).mean().iloc[-2]
+        volume_ok = df_15m[vol_col].iloc[-2] > (vol_ma * 1.5) if vol_ma > 0 else True
 
     direction = None
     if structure_15m["bos"] == "BULLISH_BOS" or structure_15m["choch"] == "BULLISH_CHOCH":
@@ -470,13 +488,11 @@ async def analyze_symbol(yf_symbol):
 
     if not direction: return None
 
-    # 3. فلتر RSI الصارم
     rsi_series = calculate_rsi(df_15m['close'], 14)
     live_rsi = rsi_series.iloc[-1]
     if "BUY" in direction and not (50.0 <= live_rsi <= 70.0): return None
     if "SELL" in direction and not (30.0 <= live_rsi <= 50.0): return None
 
-    # 4. فلتر المتوسطات EMA20 و EMA200 على فريم الساعة
     ema20_1h = df_1h['close'].ewm(span=20, adjust=False).mean().iloc[-1]
     ema200_1h = df_1h['close'].ewm(span=200, adjust=False).mean().iloc[-1]
 
@@ -505,8 +521,8 @@ async def monitor_trades_loop():
                 continue
 
             for trade_id, trade in list(active_live_trades.items()):
-                yf_symbol = [k for k, v in SYMBOL_MAP.items() if v == trade['symbol']][0]
-                df = await fetch_candles_async(yf_symbol, "1m", "1d")
+                api_symbol = [k for k, v in SYMBOL_MAP.items() if v == trade['symbol']][0]
+                df = await fetch_candles_async(api_symbol, "1min", 30)
                 if df is None or df.empty: continue
 
                 current_price = float(df['close'].iloc[-1])
@@ -521,20 +537,20 @@ async def monitor_trades_loop():
                 if "BUY" in trade['direction']:
                     if current_price >= trade['tp3']:
                         await update_trade(trade_id, "TP3_WIN", 4.5)
-                        msg = f"🔱 <b>#{symbol_name}</b>\n✅ <b>TP3 HIT! (+4.5R) 🔥🚀</b>\n📊 Price: <code>{format_price(symbol_name, trade['tp3'])}</code>\n⏱ {duration}\n⏰ {local_now}\n\n💡 إغلاق الصفقة بالكامل وتحقيق أهداف خيالية!"
+                        msg = f"🔱 <b>#{symbol_name}</b>\n✅ <b>TP3 HIT! (+4.5R) 🔥🚀</b>\n📊 Price: <code>{format_price(symbol_name, trade['tp3'])}</code>\n⏱ {duration}\n⏰ {local_now}\n\n💡 إغلاق الصفقة بالكامل!"
                         await send_telegram(msg, reply_to_message_id=msg_id)
                         del active_live_trades[trade_id]
                     elif not trade.get('hit_tp2') and current_price >= trade['tp2']:
                         trade['hit_tp2'], trade['hit_tp1'] = True, True
                         trade['sl'] = trade['entry']
                         await update_trade_progress(trade_id, hit_tp1=True, hit_tp2=True, new_sl=trade['sl'], highest=trade['highest'], lowest=trade['lowest'])
-                        msg = f"🔱 <b>#{symbol_name}</b>\n✅ <b>TP2 HIT! (+2.5R) ⚡️</b>\n📊 Price: <code>{format_price(symbol_name, trade['tp2'])}</code>\n⏱ {duration}\n⏰ {local_now}\n\n🛡 تم نقل الـ SL لنقطة الدخول لحماية الأرباح بالكامل!"
+                        msg = f"🔱 <b>#{symbol_name}</b>\n✅ <b>TP2 HIT! (+2.5R) ⚡️</b>\n📊 Price: <code>{format_price(symbol_name, trade['tp2'])}</code>\n⏱ {duration}\n⏰ {local_now}\n\n🛡 تم نقل الـ SL لنقطة الدخول!"
                         await send_telegram(msg, reply_to_message_id=msg_id)
                     elif not trade.get('hit_tp1') and current_price >= trade['tp1']:
                         trade['hit_tp1'] = True
                         trade['sl'] = trade['entry'] + ((trade['tp1'] - trade['entry']) * 0.5)
                         await update_trade_progress(trade_id, hit_tp1=True, hit_tp2=False, new_sl=trade['sl'], highest=trade['highest'], lowest=trade['lowest'])
-                        msg = f"🔱 <b>#{symbol_name}</b>\n✅ <b>TP1 HIT! (+1.2R) 🎯</b>\n📊 Price: <code>{format_price(symbol_name, trade['tp1'])}</code>\n⏱ {duration}\n⏰ {local_now}\n\n🛡 تم تفعيل التأمين الذكي وحجز الأرباح!"
+                        msg = f"🔱 <b>#{symbol_name}</b>\n✅ <b>TP1 HIT! (+1.2R) 🎯</b>\n📊 Price: <code>{format_price(symbol_name, trade['tp1'])}</code>\n⏱ {duration}\n⏰ {local_now}\n\n🛡 تفعيل التأمين الذكي!"
                         await send_telegram(msg, reply_to_message_id=msg_id)
                     elif current_price <= trade['sl']:
                         result = "TRAIL_PROFIT" if trade.get('hit_tp1') else "STOP_LOSS"
@@ -547,20 +563,20 @@ async def monitor_trades_loop():
                 elif "SELL" in trade['direction']:
                     if current_price <= trade['tp3']:
                         await update_trade(trade_id, "TP3_WIN", 4.5)
-                        msg = f"🔱 <b>#{symbol_name}</b>\n✅ <b>TP3 HIT! (+4.5R) 🔥🚀</b>\n📊 Price: <code>{format_price(symbol_name, trade['tp3'])}</code>\n⏱ {duration}\n⏰ {local_now}\n\n💡 إغلاق الصفقة بالكامل وتحقيق أهداف خيالية!"
+                        msg = f"🔱 <b>#{symbol_name}</b>\n✅ <b>TP3 HIT! (+4.5R) 🔥🚀</b>\n📊 Price: <code>{format_price(symbol_name, trade['tp3'])}</code>\n⏱ {duration}\n⏰ {local_now}\n\n💡 إغلاق الصفقة بالكامل!"
                         await send_telegram(msg, reply_to_message_id=msg_id)
                         del active_live_trades[trade_id]
                     elif not trade.get('hit_tp2') and current_price <= trade['tp2']:
                         trade['hit_tp2'], trade['hit_tp1'] = True, True
                         trade['sl'] = trade['entry']
                         await update_trade_progress(trade_id, hit_tp1=True, hit_tp2=True, new_sl=trade['sl'], highest=trade['highest'], lowest=trade['lowest'])
-                        msg = f"🔱 <b>#{symbol_name}</b>\n✅ <b>TP2 HIT! (+2.5R) ⚡️</b>\n📊 Price: <code>{format_price(symbol_name, trade['tp2'])}</code>\n⏱ {duration}\n⏰ {local_now}\n\n🛡 تم نقل الـ SL لنقطة الدخول لحماية الأرباح بالكامل!"
+                        msg = f"🔱 <b>#{symbol_name}</b>\n✅ <b>TP2 HIT! (+2.5R) ⚡️</b>\n📊 Price: <code>{format_price(symbol_name, trade['tp2'])}</code>\n⏱ {duration}\n⏰ {local_now}\n\n🛡 تم نقل الـ SL لنقطة الدخول!"
                         await send_telegram(msg, reply_to_message_id=msg_id)
                     elif not trade.get('hit_tp1') and current_price <= trade['tp1']:
                         trade['hit_tp1'] = True
                         trade['sl'] = trade['entry'] - ((trade['entry'] - trade['tp1']) * 0.5)
                         await update_trade_progress(trade_id, hit_tp1=True, hit_tp2=False, new_sl=trade['sl'], highest=trade['highest'], lowest=trade['lowest'])
-                        msg = f"🔱 <b>#{symbol_name}</b>\n✅ <b>TP1 HIT! (+1.2R) 🎯</b>\n📊 Price: <code>{format_price(symbol_name, trade['tp1'])}</code>\n⏱ {duration}\n⏰ {local_now}\n\n🛡 تم تفعيل التأمين الذكي وحجز الأرباح!"
+                        msg = f"🔱 <b>#{symbol_name}</b>\n✅ <b>TP1 HIT! (+1.2R) 🎯</b>\n📊 Price: <code>{format_price(symbol_name, trade['tp1'])}</code>\n⏱ {duration}\n⏰ {local_now}\n\n🛡 تفعيل التأمين الذكي!"
                         await send_telegram(msg, reply_to_message_id=msg_id)
                     elif current_price >= trade['sl']:
                         result = "TRAIL_PROFIT" if trade.get('hit_tp1') else "STOP_LOSS"
@@ -582,10 +598,9 @@ async def main():
     await reload_active_trades()
     
     await send_telegram(
-        f"🚀 <b>V51.0 Forex & Gold Cloud Engine Active!</b>\n"
+        f"🚀 <b>V52.0 Forex & Gold Twelve Data Cloud Engine Active!</b>\n"
         f"• Strict Threshold: <b>{SIGNAL_THRESHOLD}</b> | Min R:R: <b>{MIN_RR_RATIO}</b>\n"
-        f"• News Filter & Dynamic Gold Spreads Active 📰\n"
-        f"• Direct MetaTrader Buttons Included 📲", 
+        f"• Real-time Data Stream Enabled ⚡️", 
         include_mt_buttons=False
     )
 
@@ -596,7 +611,6 @@ async def main():
 
     while True:
         try:
-            # فحص تقويم الأخبار
             await check_economic_news()
 
             if len(active_live_trades) < MAX_ACTIVE_TRADES and not news_blackout:
@@ -605,7 +619,7 @@ async def main():
                     batch = symbols[i:i + BATCH_SIZE]
                     
                     clean_batch = [SYMBOL_MAP[s] for s in batch]
-                    logging.info(f"🔍 جاري فحص دفعة أسواق الفوركس والذهب: {clean_batch}")
+                    logging.info(f"🔍 جاري فحص دفعة أسواق الفوركس والذهب عبر Twelve Data: {clean_batch}")
 
                     tasks = [analyze_symbol(sym) for sym in batch]
                     results = await asyncio.gather(*tasks)
@@ -620,7 +634,7 @@ async def main():
 
                                 msg = (
                                     f"<b>#{display_name.replace('/', '')}</b> ({trade['direction']})\n"
-                                    f"Exchanges: Forex & Gold Masters\n\n"
+                                    f"Exchanges: Twelve Data Cloud Masters\n\n"
                                     f"Entry Targets:\n"
                                     f"1) <code>{format_price(display_name, trade['entry'])}</code>\n\n"
                                     f"Take-Profit Targets:\n"
@@ -654,7 +668,7 @@ if __name__ == "__main__":
     keep_alive()
     while True:
         try:
-            print("\n🚀 Starting V51.0 Forex & Gold Cloud Engine...")
+            print("\n🚀 Starting V52.0 Forex & Gold Twelve Data Cloud Engine...")
             asyncio.run(main())
         except KeyboardInterrupt:
             break
